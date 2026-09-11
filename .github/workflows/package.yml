@@ -40,6 +40,9 @@ jobs:
             target: macos-x86_64
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release binary
         run: cargo build --release --locked -p servoloop-cli
@@ -66,7 +69,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive=$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)
+          archive=$(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print | head -n1)
           if command -v sha256sum >/dev/null; then
             (cd "$(dirname "$archive")" && sha256sum -c SHA256SUMS)
           else
@@ -77,7 +80,7 @@ jobs:
           rm -rf extracted && mkdir extracted
           case "$archive" in
             *.tar.gz) tar -xzf "$archive" -C extracted; bin=extracted/bin/servoloop ;;
-            *.zip) unzip -q "$archive" -d extracted; bin=extracted/bin/servoloop.exe ;;
+            *.zip) python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$archive" extracted; bin=extracted/bin/servoloop.exe ;;
           esac
           "$bin" --version
           "$bin" run --demo --store "$RUNNER_TEMP/servoloop-extracted-store" >/dev/null
@@ -86,7 +89,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          archive=$(find dist -type f -name '*.tar.gz' -print | head -n1)
           bash scripts/install.sh --archive "$archive" --checksum-file dist/SHA256SUMS \
             --prefix "$RUNNER_TEMP/servoloop install/bin"
           "$RUNNER_TEMP/servoloop install/bin/servoloop" --version

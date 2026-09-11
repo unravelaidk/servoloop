@@ -7,6 +7,14 @@ if (-not $line) { throw 'No SHA-256 entry for the archive.' }
 $expected = ($line -split '\s+')[0].ToLowerInvariant()
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Archive).Hash.ToLowerInvariant()
 if ($expected -ne $actual) { throw 'Checksum verification failed.' }
+[Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem') | Out-Null
+$zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+try {
+  $allowed = @('bin/', 'bin/servoloop.exe', 'LICENSE', 'NOTICE', 'README')
+  foreach ($entry in $zip.Entries) {
+    if ($allowed -notcontains $entry.FullName) { throw "Archive contains unexpected path: $($entry.FullName)" }
+  }
+} finally { $zip.Dispose() }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {

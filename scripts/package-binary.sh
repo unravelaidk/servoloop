@@ -18,9 +18,11 @@ trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$out"
 if [[ "$target" == windows-* ]]; then
-  install -Dm0755 "$binary" "$stage/bin/servoloop.exe"
+  mkdir -p "$stage/bin"
+  install -m 0755 "$binary" "$stage/bin/servoloop.exe"
 else
-  install -Dm0755 "$binary" "$stage/bin/servoloop"
+  mkdir -p "$stage/bin"
+  install -m 0755 "$binary" "$stage/bin/servoloop"
 fi
 cp "$root/LICENSE" "$root/crates/servoloop-providers/NOTICE" "$stage/"
 cat >"$stage/README" <<EOF
@@ -32,7 +34,18 @@ EOF
 
 archive="$out/servoloop-${version}-${target}"
 if [[ "$target" == windows-* ]]; then
-  (cd "$stage" && zip -q -r "${archive}.zip" .)
+  python - "$stage" "${archive}.zip" <<'PY'
+import os
+import sys
+import zipfile
+
+root, output = sys.argv[1:]
+with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+    for directory, _, files in os.walk(root):
+        for name in files:
+            path = os.path.join(directory, name)
+            archive.write(path, os.path.relpath(path, root))
+PY
   checksum_file="${archive}.zip"
 else
   tar -C "$stage" -czf "${archive}.tar.gz" .

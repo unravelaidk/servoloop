@@ -30,7 +30,7 @@ case "$os:$arch" in
   Linux:x86_64)
     target=linux-x86_64-glibc-2.39; extension=tar.gz
     glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
-    if [[ -z "$glibc" ]] || [[ "$(printf '%s\n' 2.39 "$glibc" | sort -V | head -n1)" != "2.39" ]]; then
+    if [[ -z "$glibc" ]] || ! awk -v have="$glibc" 'BEGIN { split(have, v, "."); exit !((v[1] > 2) || (v[1] == 2 && v[2] >= 39)) }'; then
       echo "Linux archive requires glibc 2.39 or newer (detected: ${glibc:-unknown}); use a newer host or build from source" >&2
       exit 1
     fi
