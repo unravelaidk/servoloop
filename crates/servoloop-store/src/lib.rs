@@ -582,7 +582,7 @@ mod tests {
             })
             .unwrap()
             .into_iter()
-            .chain([b'\n'])
+            .chain(*b"\n")
             .collect::<Vec<_>>(),
         )
         .unwrap();
