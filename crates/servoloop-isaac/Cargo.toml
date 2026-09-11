@@ -1,0 +1,17 @@
+[package]
+name = "servoloop-isaac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+servoloop-core = { path = "../servoloop-core" }
+servoloop-robot = { path = "../servoloop-robot" }
+thiserror.workspace = true
+tokio.workspace = true

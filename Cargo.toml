@@ -3,8 +3,10 @@ members = [
     "crates/servoloop-core",
     "crates/servoloop-providers",
     "crates/servoloop-robot",
+    "crates/servoloop-isaac",
     "examples/simulated-arm",
     "examples/openai-compatible-demo",
+    "examples/isaac-sim",
 ]
 resolver = "2"
 
