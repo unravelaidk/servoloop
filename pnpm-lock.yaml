@@ -8,7 +8,20 @@ importers:
 
   .: {}
 
-  packages/servoloop: {}
+  packages/servoloop:
+    optionalDependencies:
+      servoloop-darwin-arm64:
+        specifier: 0.1.0
+        version: link:../servoloop-darwin-arm64
+      servoloop-darwin-x64:
+        specifier: 0.1.0
+        version: link:../servoloop-darwin-x64
+      servoloop-linux-x64:
+        specifier: 0.1.0
+        version: link:../servoloop-linux-x64
+      servoloop-win32-x64:
+        specifier: 0.1.0
+        version: link:../servoloop-win32-x64
 
   packages/servoloop-darwin-arm64: {}
 
