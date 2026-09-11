@@ -3,6 +3,8 @@ members = [
     "crates/servoloop-core",
     "crates/servoloop-providers",
     "crates/servoloop-robot",
+    "crates/servoloop-store",
+    "apps/servoloop-cli",
     "examples/simulated-arm",
     "examples/openai-compatible-demo",
 ]
@@ -16,6 +18,7 @@ repository = "https://github.com/unravelaidk/servoloop"
 rust-version = "1.88"
 
 [workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
 async-trait = "0.1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = [
@@ -26,4 +29,4 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
