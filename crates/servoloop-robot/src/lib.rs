@@ -254,6 +254,7 @@ pub struct RobotHarness {
     observe_timeout: Duration,
     execute_timeout: Duration,
     stop_timeout: Duration,
+    queue_timeout: Duration,
     tolerance: f64,
 }
 impl RobotHarness {
@@ -270,6 +271,7 @@ impl RobotHarness {
             observe_timeout: Duration::from_secs(5),
             execute_timeout: Duration::from_secs(5),
             stop_timeout: Duration::from_secs(2),
+            queue_timeout: Duration::from_secs(5),
             tolerance: 1e-6,
         }
     }
@@ -298,6 +300,12 @@ impl RobotHarness {
     }
     pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
         self.stop_timeout = timeout;
+        self
+    }
+    /// Bound admission to the serialized command lifecycle. Expiry rejects the
+    /// waiting command without stopping or dispatching another caller's motion.
+    pub fn with_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.queue_timeout = timeout;
         self
     }
     pub fn with_postcondition_tolerance(mut self, tolerance: f64) -> Self {
@@ -429,7 +437,9 @@ impl RobotHarness {
         let generation = *stop.borrow();
         let _gate = tokio::select! {
             biased;
-            gate = self.coordinator.gate.lock() => gate,
+            gate = tokio::time::timeout(self.queue_timeout, self.coordinator.gate.lock()) => {
+                gate.map_err(|_| Error::Tool("robot command queue timed out; command not dispatched".into()))?
+            },
             _ = &mut cancel => return Err(Error::Stopped),
             result = stop.changed() => {
                 if result.is_ok() { return Err(Error::Stopped); }
@@ -526,13 +536,32 @@ impl RobotHarness {
         })
     }
     async fn cleanup_fault(&self, reason: String) {
-        let _stop_gate = self.coordinator.stop_gate.lock().await;
-        self.latch(reason).await;
-        if matches!(
-            tokio::time::timeout(self.stop_timeout, self.driver.stop()).await,
-            Ok(Ok(()))
-        ) {
-            self.coordinator.lifecycle.lock().await.stop_acknowledged = true;
+        let _stop_gate = match tokio::time::timeout(
+            self.stop_timeout,
+            self.coordinator.stop_gate.lock(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.latch(format!("{reason}; cleanup stop queue timed out"))
+                    .await;
+                return;
+            }
+        };
+        self.latch(reason.clone()).await;
+        match tokio::time::timeout(self.stop_timeout, self.driver.stop()).await {
+            Ok(Ok(())) => {
+                self.coordinator.lifecycle.lock().await.stop_acknowledged = true;
+            }
+            Ok(Err(error)) => {
+                self.latch(format!("{reason}; cleanup stop failed: {error}"))
+                    .await;
+            }
+            Err(_) => {
+                self.latch(format!("{reason}; cleanup stop timed out"))
+                    .await;
+            }
         }
     }
 }
@@ -807,6 +836,8 @@ mod tests {
         release_execute: Notify,
         block_observe: AtomicBool,
         block_execute: AtomicBool,
+        reject_execute: AtomicBool,
+        skip_motion: AtomicBool,
         fail_stop: AtomicBool,
         calls: Mutex<Vec<RobotCommand>>,
         stop_calls: Mutex<usize>,
@@ -830,6 +861,8 @@ mod tests {
                 release_execute: Notify::new(),
                 block_observe: AtomicBool::new(true),
                 block_execute: AtomicBool::new(true),
+                reject_execute: AtomicBool::new(false),
+                skip_motion: AtomicBool::new(false),
                 fail_stop: AtomicBool::new(false),
                 calls: Mutex::new(Vec::new()),
                 stop_calls: Mutex::new(0),
@@ -857,12 +890,20 @@ mod tests {
             if self.block_execute.swap(false, Ordering::SeqCst) {
                 self.release_execute.notified().await;
             }
-            if let RobotCommand::MoveJoint { joint, position } = command {
-                self.state.lock().unwrap().joints.insert(joint, position);
+            let accepted = !self.reject_execute.load(Ordering::SeqCst);
+            if accepted && !self.skip_motion.load(Ordering::SeqCst) {
+                if let RobotCommand::MoveJoint { joint, position } = command {
+                    self.state.lock().unwrap().joints.insert(joint, position);
+                }
             }
             Ok(CommandReceipt {
-                accepted: true,
-                message: "accepted".into(),
+                accepted,
+                message: if accepted {
+                    "accepted"
+                } else {
+                    "controller rejected"
+                }
+                .into(),
                 metadata: Value::Null,
             })
         }
@@ -1139,5 +1180,118 @@ mod tests {
         assert!(a.await.unwrap().is_ok());
         assert!(b.await.unwrap().is_ok());
         assert_eq!(driver.calls.lock().unwrap().len(), 2);
+    }
+
+    fn small_move() -> RobotCommand {
+        RobotCommand::MoveJoint {
+            joint: "shoulder".into(),
+            position: 0.1,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_command_expires_without_dispatch_or_stopping_active_motion() {
+        let driver = ControlledDriver::new();
+        driver.block_observe.store(false, Ordering::SeqCst);
+        let harness = controlled_harness(driver.clone())
+            .with_queue_timeout(Duration::from_secs(1))
+            .with_execute_timeout(Duration::from_secs(30));
+        let active = tokio::spawn({
+            let harness = harness.clone();
+            async move { harness.execute(small_move()).await }
+        });
+        driver.execute_started.notified().await;
+        let error = harness.execute(small_move()).await.unwrap_err();
+        assert!(error.to_string().contains("queue timed out"));
+        assert_eq!(driver.calls.lock().unwrap().len(), 1);
+        assert_eq!(*driver.stop_calls.lock().unwrap(), 0);
+        driver.release_execute.notify_one();
+        assert!(active.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_queue_deadline_latches_fault_without_dispatch() {
+        let driver = ControlledDriver::new();
+        let harness = controlled_harness(driver.clone());
+        let _held_stop = harness.coordinator.stop_gate.lock().await;
+        harness.cleanup_fault("uncertain command".into()).await;
+        assert!(matches!(harness.status().await, RobotStatus::Fault(reason)
+            if reason.contains("uncertain command") && reason.contains("cleanup stop queue timed out")));
+        assert!(harness.execute(small_move()).await.is_err());
+        assert!(driver.calls.lock().unwrap().is_empty());
+        assert!(!harness.coordinator.lifecycle.lock().await.stop_acknowledged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_timeout_and_stop_timeout_remain_faulted_without_retry() {
+        let driver = ControlledDriver::new();
+        driver.block_observe.store(false, Ordering::SeqCst);
+        driver.block_stop.store(true, Ordering::SeqCst);
+        let harness = controlled_harness(driver.clone());
+        let start = tokio::time::Instant::now();
+        assert!(harness.execute(small_move()).await.is_err());
+        assert!(start.elapsed() <= Duration::from_secs(7));
+        assert!(matches!(harness.status().await, RobotStatus::Fault(reason)
+            if reason.contains("execute timed out") && reason.contains("cleanup stop timed out")));
+        assert!(harness.reset_emergency_stop().await.is_err());
+        assert!(harness.execute(small_move()).await.is_err());
+        assert_eq!(driver.calls.lock().unwrap().len(), 1);
+        assert_eq!(*driver.stop_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verification_timeout_stops_and_requires_explicit_reset() {
+        let driver = ControlledDriver::new();
+        driver.block_observe.store(false, Ordering::SeqCst);
+        let harness = controlled_harness(driver.clone());
+        let command = tokio::spawn({
+            let harness = harness.clone();
+            async move { harness.execute(small_move()).await }
+        });
+        driver.execute_started.notified().await;
+        driver.block_observe.store(true, Ordering::SeqCst);
+        driver.release_execute.notify_one();
+        assert!(command.await.unwrap().is_err());
+        assert!(matches!(harness.status().await, RobotStatus::Fault(reason)
+            if reason.contains("post-action observation failed")));
+        assert_eq!(*driver.stop_calls.lock().unwrap(), 1);
+        assert!(harness.execute(small_move()).await.is_err());
+        harness.reset_emergency_stop().await.unwrap();
+        assert_eq!(harness.status().await, RobotStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn rejected_receipt_is_not_a_successful_tool_result() {
+        let driver = ControlledDriver::new();
+        driver.block_observe.store(false, Ordering::SeqCst);
+        driver.block_execute.store(false, Ordering::SeqCst);
+        driver.reject_execute.store(true, Ordering::SeqCst);
+        let harness = controlled_harness(driver.clone());
+        let mut registry = ToolRegistry::new();
+        harness.register_tools(&mut registry).unwrap();
+        let error = registry
+            .get("robot_command")
+            .unwrap()
+            .execute(serde_json::to_value(small_move()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("controller rejected"));
+        assert_eq!(driver.state.lock().unwrap().joints["shoulder"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_but_unreached_target_faults_and_reports_stop_failure() {
+        let driver = ControlledDriver::new();
+        driver.block_observe.store(false, Ordering::SeqCst);
+        driver.block_execute.store(false, Ordering::SeqCst);
+        driver.skip_motion.store(true, Ordering::SeqCst);
+        driver.fail_stop.store(true, Ordering::SeqCst);
+        let harness = controlled_harness(driver.clone());
+        assert!(harness.execute(small_move()).await.is_err());
+        assert!(matches!(harness.status().await, RobotStatus::Fault(reason)
+            if reason.contains("verification failed") && reason.contains("synthetic stop failure")));
+        assert!(harness.reset_emergency_stop().await.is_err());
+        assert!(harness.execute(small_move()).await.is_err());
+        assert_eq!(driver.calls.lock().unwrap().len(), 1);
     }
 }
