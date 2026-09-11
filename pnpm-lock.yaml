@@ -1,0 +1,19 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/servoloop: {}
+
+  packages/servoloop-darwin-arm64: {}
+
+  packages/servoloop-darwin-x64: {}
+
+  packages/servoloop-linux-x64: {}
+
+  packages/servoloop-win32-x64: {}

@@ -1,0 +1,1 @@
+{"name":"servoloop-win32-x64","version":"0.1.0","description":"ServoLoop native binary for Windows x64","license":"AGPL-3.0-only","os":["win32"],"cpu":["x64"],"files":["bin","LICENSE","NOTICE"],"bin":{"servoloop":"bin/servoloop.exe"},"exports":{"./bin/servoloop.exe":"./bin/servoloop.exe"}}

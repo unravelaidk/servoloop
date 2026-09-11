@@ -4,6 +4,32 @@ This page describes the currently supported binary archives and local
 installation paths. The packaging workflow uploads artifacts for inspection;
 it does not publish releases, so there is no public download URL yet.
 
+## Install with pnpm
+
+The npm distribution uses a small launcher and one optional, platform-specific
+package. It does not run a download or install lifecycle script. Node.js 20 or
+newer and a current pnpm release are required.
+
+The package name is provisional until an npm release is published. Until then,
+install matching tarballs from a local build. The launcher resolves its native
+package directly and never searches `PATH`:
+
+```bash
+pnpm add --global ./servoloop-0.1.0.tgz ./servoloop-linux-x64-0.1.0.tgz
+servoloop --version
+servoloop --help
+servoloop run --demo --store "$HOME/.local/state/servoloop-demo"
+```
+
+Use `pnpm add --global servoloop` after the launcher and platform packages are
+published. Keep optional dependencies enabled. If you used `--no-optional`,
+reinstall with `pnpm add --global servoloop --force`.
+
+Linux npm packages require glibc 2.39 or newer and don't support musl Linux.
+The supported targets are Linux x64, macOS arm64 and x64, and Windows x64.
+The launcher reports an actionable error for unsupported hosts or a missing
+optional package.
+
 ## Supported binary targets
 
 The workflow builds and smoke-tests these native targets:
