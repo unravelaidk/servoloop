@@ -321,6 +321,8 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             "--model-timeout",
             "--tool-timeout",
             "--demo",
+            "--json",
+            "--output",
         ],
         "models" => &[
             "--provider",
