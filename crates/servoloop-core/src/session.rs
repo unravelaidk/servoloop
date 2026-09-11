@@ -301,7 +301,7 @@ impl Session {
 
         // Insert in reverse index order so earlier insertions don't shift
         // later indices.
-        insert_at.sort_by(|a, b| b.0.cmp(&a.0));
+        insert_at.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         for (idx, call) in insert_at {
             let unknown = Message::ToolUnknown {
                 call_id: call.id.clone(),
