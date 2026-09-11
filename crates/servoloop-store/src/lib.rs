@@ -108,6 +108,8 @@ impl Drop for SessionGuard {
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     version: u32,
+    /// Number of journal records represented by this terminal snapshot.
+    journal_sequence: u64,
     session: servoloop_core::Session,
 }
 
@@ -343,8 +345,10 @@ impl Store {
             return Err(StoreError::Unresolved);
         }
         let dir = self.session_dir(&session.id)?;
+        let journal_sequence = self.records(&session.id)?.len() as u64;
         let data = serde_json::to_vec(&Snapshot {
-            version: SCHEMA_VERSION,
+            version: 2,
+            journal_sequence,
             session: session.clone(),
         })?;
         if data.len() as u64 > MAX_JOURNAL {
@@ -362,7 +366,29 @@ impl Store {
         sync_directory(&dir)
     }
     pub fn load_snapshot(&self, id: &str) -> Result<servoloop_core::Session> {
-        let path = self.session_dir(id)?.join("snapshot.json");
+        Self::safe_id(id)?;
+        let dir = self.root.join(id);
+        if !dir.is_dir() {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session not found",
+            )));
+        }
+        let path = dir.join("snapshot.json");
+        self.load_snapshot_file(id, path)
+    }
+
+    /// Load a snapshot while holding the caller's execution lease. This checks
+    /// the journal watermark before returning any session state.
+    pub fn load_snapshot_guarded(&self, guard: &SessionGuard) -> Result<servoloop_core::Session> {
+        if guard.store.root != self.root {
+            return Err(StoreError::Busy);
+        }
+        let path = self.session_dir(guard.session_id())?.join("snapshot.json");
+        self.load_snapshot_file(guard.session_id(), path)
+    }
+
+    fn load_snapshot_file(&self, id: &str, path: PathBuf) -> Result<servoloop_core::Session> {
         reject_symlink(&path)?;
         let mut data = Vec::new();
         File::open(path)?
@@ -372,7 +398,7 @@ impl Store {
             return Err(StoreError::TooLarge);
         }
         let snapshot: Snapshot = serde_json::from_slice(&data)?;
-        if snapshot.version != SCHEMA_VERSION {
+        if snapshot.version != 2 {
             return Err(StoreError::UnsupportedVersion(snapshot.version));
         }
         if snapshot.session.id != id {
@@ -388,6 +414,12 @@ impl Store {
                 .any(|m| matches!(m, servoloop_core::Message::ToolUnknown { .. }))
         {
             return Err(StoreError::Unresolved);
+        }
+        let records = self.records(id)?;
+        if snapshot.journal_sequence != records.len() as u64 {
+            return Err(StoreError::InvalidJournal(
+                "snapshot journal watermark does not match journal".into(),
+            ));
         }
         Ok(snapshot.session)
     }
