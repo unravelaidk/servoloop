@@ -161,6 +161,39 @@ fn demo_runs_real_loop_and_writes_journal() {
 }
 
 #[test]
+fn run_accepts_machine_output_flags() {
+    let root = std::env::temp_dir().join(format!("servoloop-cli-output-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let out = bin()
+        .args(["run", "--demo", "--json", "--output", "json", "--store"])
+        .arg(&root)
+        .args(["--session", "output-session"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap();
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn invalid_output_format_is_rejected_with_usage() {
+    let out = bin()
+        .args(["models", "--provider", "ollama", "--output", "yaml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid value") || stderr.contains("possible values"));
+    assert!(stderr.contains("--help"));
+}
+
+#[test]
 fn offline_model_does_not_network() {
     let out = bin()
         .args([
@@ -170,6 +203,8 @@ fn offline_model_does_not_network() {
             "--offline",
             "--model",
             "local",
+            "--output",
+            "json",
         ])
         .output()
         .unwrap();
@@ -216,10 +251,12 @@ fn live_run_requires_prompt_before_networking() {
 
 #[test]
 fn live_run_uses_local_model_and_persists_verified_tool_action() {
+    let secret = r#"test"key\slash"#.to_string();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = requests.clone();
+    let response_secret = secret.clone();
     let server = thread::spawn(move || {
         for index in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
@@ -255,7 +292,7 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
                 let arguments =
                     serde_json::json!({"command":"move_joint","joint":"shoulder","position":0.2 + index as f64 * 0.1})
                         .to_string();
-                serde_json::json!({"choices":[{"message":{"content":"moving","tool_calls":[{"id":format!("move-{index}"),"type":"function","function":{"name":"robot_command","arguments":arguments}}]},"finish_reason":"tool_calls"}]})
+                serde_json::json!({"choices":[{"message":{"content":format!("echo {response_secret}"),"tool_calls":[{"id":format!("move-{index}"),"type":"function","function":{"name":"robot_command","arguments":arguments}}]},"finish_reason":"tool_calls"}]})
             } else {
                 serde_json::json!({"choices":[{"message":{"content":"verified"},"finish_reason":"stop"}]})
             };
@@ -267,7 +304,7 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
     let root = std::env::temp_dir().join(format!("servoloop-live-{}", std::process::id()));
     let base = format!("http://{address}/v1");
     let out = bin()
-        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_API_KEY", &secret)
         .args([
             "run",
             "--provider",
@@ -294,7 +331,7 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
     assert!(captured.iter().all(|request| {
         request
             .to_ascii_lowercase()
-            .contains("authorization: bearer test-key")
+            .contains(&format!("authorization: bearer {secret}"))
     }));
     assert!(captured[0].contains("move the shoulder"));
     assert!(captured[1].contains("simulator accepted command"));
@@ -318,7 +355,9 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
         .unwrap()
         .path()
         .join("journal.ndjson");
-    let journal_text = fs::read_to_string(journal).unwrap();
+    let journal_bytes = fs::read(&journal).unwrap();
+    assert!(!String::from_utf8_lossy(&journal_bytes).contains(&secret));
+    let journal_text = String::from_utf8_lossy(&journal_bytes);
     let records: Vec<serde_json::Value> = journal_text
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -347,6 +386,18 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
         .as_array()
         .unwrap()
         .is_empty());
+    let snapshot_bytes = fs::read(
+        fs::read_dir(&root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("snapshot.json"),
+    )
+    .unwrap();
+    assert!(!stdout.contains(&secret));
+    assert!(!String::from_utf8_lossy(&snapshot_bytes).contains(&secret));
     let _ = fs::remove_dir_all(root);
 }
 
