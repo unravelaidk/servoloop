@@ -104,6 +104,8 @@ pub struct DiscoveryOptions {
     pub explicit_model_ids: Vec<String>,
     /// Override the Models.dev catalog URL.
     pub models_dev_url_override: Option<String>,
+    /// Maximum time to wait for each discovery request.
+    pub timeout: Duration,
 }
 
 impl Default for DiscoveryOptions {
@@ -113,6 +115,7 @@ impl Default for DiscoveryOptions {
             filter_for_tools: false,
             explicit_model_ids: Vec::new(),
             models_dev_url_override: None,
+            timeout: Duration::from_secs(10),
         }
     }
 }
@@ -125,6 +128,7 @@ impl DiscoveryOptions {
             filter_for_tools: true,
             explicit_model_ids: Vec::new(),
             models_dev_url_override: None,
+            timeout: Duration::from_secs(10),
         }
     }
 }
@@ -183,27 +187,44 @@ impl Discovery {
         options: &DiscoveryOptions,
     ) -> ProviderResult<Vec<DiscoveredModel>> {
         let endpoint = spec.resolve_endpoint();
+        let explicit_model_ids = validate_explicit_model_ids(&options.explicit_model_ids)?;
+        // Resolve this once: besides avoiding inconsistent fallback behavior,
+        // this makes an env-provided catalog URL part of cache identity.
+        let catalog_url = catalog::resolve_catalog_url(options.models_dev_url_override.as_deref());
         let key = DiscoveryCacheKey::new(
+            spec.id,
             &endpoint,
             &spec.cache_identity(),
             &spec.protocol.to_string(),
             options.include_models_dev,
             options.filter_for_tools,
+            explicit_model_ids.clone(),
+            &catalog_url,
+            options.timeout,
         );
 
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
 
-        // 1. Fetch from the provider's /models endpoint.
-        let endpoint_models = fetch_endpoint_models(spec).await.unwrap_or_default();
+        // 1. Fetch from the provider's endpoint. Ollama's native API is the
+        // authoritative discovery API; its OpenAI-compatible /v1/models is
+        // not consistently implemented by Ollama installations.
+        let endpoint_result = if spec.id == "ollama" {
+            fetch_ollama_tags_with_options(&endpoint, spec, options.timeout).await
+        } else {
+            fetch_endpoint_models(spec, options.timeout).await
+        };
+        let endpoint_models = endpoint_result.as_ref().ok().cloned().unwrap_or_default();
 
         // 2. Fetch Models.dev catalog and merge.
-        let mut models = if options.include_models_dev {
-            let catalog = catalog::fetch_catalog(options.models_dev_url_override.as_deref())
-                .await
-                .unwrap_or_default();
-            merge_with_catalog(spec, &endpoint_models, &catalog)
+        let catalog_result = if options.include_models_dev {
+            Some(fetch_catalog_at(&catalog_url).await)
+        } else {
+            None
+        };
+        let mut models = if let Some(Ok(catalog)) = catalog_result.as_ref() {
+            merge_with_catalog(spec, &endpoint_models, catalog)
         } else {
             endpoint_models
                 .into_iter()
@@ -223,7 +244,7 @@ impl Discovery {
         };
 
         // 3. Add explicit model IDs.
-        for explicit_id in &options.explicit_model_ids {
+        for explicit_id in &explicit_model_ids {
             if !models.iter().any(|m| &m.model_id == explicit_id) {
                 models.push(DiscoveredModel {
                     provider_id: spec.id.to_string(),
@@ -245,6 +266,18 @@ impl Discovery {
             models.retain(|m| !m.deprecated && m.tool_support != ToolSupport::No);
         }
 
+        // An empty result is not a successful discovery when every source
+        // failed. Do not cache that failure, so a later retry can recover.
+        let endpoint_failed = endpoint_result.is_err();
+        let catalog_failed =
+            options.include_models_dev && catalog_result.as_ref().is_some_and(Result::is_err);
+        let all_sources_failed = endpoint_failed && (!options.include_models_dev || catalog_failed);
+        if models.is_empty() && all_sources_failed && explicit_model_ids.is_empty() {
+            return Err(ProviderError::discovery_failed(
+                "provider endpoint and catalog were unavailable",
+            ));
+        }
+
         // 5. Cache and return.
         self.cache.insert(key, models.clone());
         Ok(models)
@@ -256,6 +289,26 @@ impl Discovery {
     }
 }
 
+fn validate_explicit_model_ids(ids: &[String]) -> ProviderResult<Vec<String>> {
+    let mut normalized = Vec::with_capacity(ids.len());
+    for id in ids {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err(ProviderError::invalid(
+                "explicit model IDs must not be empty or whitespace",
+            ));
+        }
+        if !normalized.iter().any(|existing| existing == trimmed) {
+            normalized.push(trimmed.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
+async fn fetch_catalog_at(url: &str) -> ProviderResult<Vec<CatalogProvider>> {
+    catalog::fetch_catalog(Some(url)).await
+}
+
 impl Default for Discovery {
     fn default() -> Self {
         Self::new()
@@ -263,12 +316,15 @@ impl Default for Discovery {
 }
 
 /// Fetch model IDs from a provider's OpenAI-compatible `/models` endpoint.
-async fn fetch_endpoint_models(spec: &ProviderSpec) -> ProviderResult<Vec<String>> {
+async fn fetch_endpoint_models(
+    spec: &ProviderSpec,
+    timeout: Duration,
+) -> ProviderResult<Vec<String>> {
     let endpoint = spec.resolve_endpoint();
     let url = join_url(&endpoint, "models");
 
     let client = build_client()?;
-    let mut request = client.get(&url).timeout(Duration::from_secs(10));
+    let mut request = client.get(&url).timeout(timeout);
 
     let key = spec.resolve_key();
     if let Some(key) = &key {
@@ -396,13 +452,31 @@ pub fn merge_with_catalog(
 /// normalizes the tag list, returning model IDs suitable for use with
 /// the `/v1/chat/completions` runtime endpoint.
 pub async fn fetch_ollama_tags(base_url: &str) -> ProviderResult<Vec<String>> {
+    fetch_ollama_tags_request(base_url, None, Duration::from_secs(10)).await
+}
+
+async fn fetch_ollama_tags_with_options(
+    base_url: &str,
+    spec: &ProviderSpec,
+    timeout: Duration,
+) -> ProviderResult<Vec<String>> {
+    fetch_ollama_tags_request(base_url, spec.resolve_key().as_ref(), timeout).await
+}
+
+async fn fetch_ollama_tags_request(
+    base_url: &str,
+    key: Option<&crate::secret::Secret>,
+    timeout: Duration,
+) -> ProviderResult<Vec<String>> {
     // The native tags endpoint is at /api/tags (no /v1 prefix).
     let tags_url = join_ollama_tags_url(base_url);
 
     let client = build_client()?;
-    let response = client
-        .get(&tags_url)
-        .timeout(Duration::from_secs(10))
+    let mut request = client.get(&tags_url).timeout(timeout);
+    if let Some(key) = key {
+        request = request.bearer_auth(key.as_str());
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| ProviderError::transient(format!("Ollama tags request failed: {e}")))?;
@@ -668,18 +742,26 @@ mod tests {
     #[test]
     fn discovery_cache_key_isolates_by_endpoint() {
         let key1 = DiscoveryCacheKey::new(
+            "openai",
             "https://api.openai.com/v1",
             "openai:abc",
             "openai-chat-completions",
             true,
             false,
+            Vec::new(),
+            "https://models.dev/api.json",
+            Duration::from_secs(10),
         );
         let key2 = DiscoveryCacheKey::new(
+            "openai",
             "https://api.openai.com/v1",
             "openai:xyz",
             "openai-chat-completions",
             true,
             false,
+            Vec::new(),
+            "https://models.dev/api.json",
+            Duration::from_secs(10),
         );
         assert_ne!(key1, key2, "different account identities must not collide");
     }
