@@ -10,6 +10,7 @@ name = "servoloop"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 servoloop-core = { path = "../../crates/servoloop-core" }
 servoloop-providers = { path = "../../crates/servoloop-providers" }
 servoloop-store = { path = "../../crates/servoloop-store" }
