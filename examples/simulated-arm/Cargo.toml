@@ -1,0 +1,13 @@
+[package]
+name = "servoloop-simulated-arm"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+servoloop-core = { path = "../../crates/servoloop-core" }
+servoloop-robot = { path = "../../crates/servoloop-robot" }
+tokio.workspace = true
