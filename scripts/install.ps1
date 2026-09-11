@@ -2,7 +2,7 @@ param([string]$Archive, [string]$ChecksumFile, [string]$Prefix = "$HOME\.local\b
 $ErrorActionPreference = 'Stop'
 if (-not $Archive -or -not $ChecksumFile) { throw 'Use -Archive FILE -ChecksumFile SHA256SUMS.' }
 $archiveName = [regex]::Escape((Split-Path $Archive -Leaf))
-$line = Get-Content -LiteralPath $ChecksumFile | Where-Object { $_ -match ('\s' + $archiveName + '$') } | Select-Object -First 1
+$line = Get-Content -LiteralPath $ChecksumFile | Where-Object { $_ -match ('^[0-9a-fA-F]{64}\s+\*?' + $archiveName + '\s*$') } | Select-Object -First 1
 if (-not $line) { throw 'No SHA-256 entry for the archive.' }
 $expected = ($line -split '\s+')[0].ToLowerInvariant()
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Archive).Hash.ToLowerInvariant()
