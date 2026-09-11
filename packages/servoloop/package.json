@@ -1,0 +1,16 @@
+{
+  "name": "servoloop",
+  "version": "0.1.0",
+  "description": "ServoLoop command-line launcher",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "bin": { "servoloop": "bin/servoloop.mjs" },
+  "engines": { "node": ">=20" },
+  "optionalDependencies": {
+    "servoloop-linux-x64": "0.1.0",
+    "servoloop-darwin-arm64": "0.1.0",
+    "servoloop-darwin-x64": "0.1.0",
+    "servoloop-win32-x64": "0.1.0"
+  },
+  "files": ["bin", "LICENSE", "NOTICE"]
+}

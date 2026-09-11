@@ -11,7 +11,10 @@ on:
     paths:
       - '.github/workflows/package.yml'
       - 'scripts/**'
-      - 'apps/servoloop-cli/**'
+      - 'packages/**'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
       - 'docs/install.md'
       - 'README.md'
       - 'CONTRIBUTING.md'
@@ -32,18 +35,31 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: linux-x86_64-glibc-2.39
+            npm-target: linux-x64-glibc-2.39
           - os: windows-latest
             target: windows-x86_64
+            npm-target: win32-x64
           - os: macos-14
             target: macos-arm64
+            npm-target: darwin-arm64
           - os: macos-15-intel
             target: macos-x86_64
+            npm-target: darwin-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
       - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install workspace tooling
+        run: pnpm install --frozen-lockfile
       - name: Build release binary
         run: cargo build --release --locked -p servoloop-cli
       - name: Smoke test
@@ -65,6 +81,16 @@ jobs:
           bin="target/release/servoloop"
           [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/servoloop.exe"
           bash scripts/package-binary.sh "$bin" "$VERSION" "$TARGET"
+      - name: Pack and smoke test npm packages
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version || '0.1.0' }}
+          TARGET: ${{ matrix.npm-target }}
+        run: |
+          set -euo pipefail
+          bin="target/release/servoloop"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/servoloop.exe"
+          node scripts/test-npm-install.mjs "$bin" "$VERSION" "$TARGET"
       - name: Verify archive checksum and extracted binary
         shell: bash
         run: |
@@ -115,5 +141,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: servoloop-${{ matrix.target }}
-          path: dist/*
+          path: |
+            dist/*
+            dist/npm/*
           if-no-files-found: error

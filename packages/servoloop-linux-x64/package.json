@@ -1,0 +1,10 @@
+{
+  "name": "servoloop-linux-x64",
+  "version": "0.1.0",
+  "description": "ServoLoop native binary for Linux x64 (glibc 2.39+)",
+  "license": "AGPL-3.0-only",
+  "os": ["linux"], "cpu": ["x64"],
+  "files": ["bin", "LICENSE", "NOTICE"],
+  "bin": { "servoloop": "bin/servoloop" },
+  "exports": { "./bin/servoloop": "./bin/servoloop" }
+}
