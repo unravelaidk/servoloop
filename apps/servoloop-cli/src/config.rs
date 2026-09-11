@@ -1,4 +1,4 @@
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) version: Option<u32>,
@@ -40,12 +40,16 @@ pub(crate) fn init(args: &[String]) -> ExitCode {
 }
 
 pub(crate) fn store(args: &[String], config: Option<&Config>) -> Result<Store, String> {
-    let p = value(args, "--store")
+    Store::open(store_path(args, config)).map_err(|e| e.to_string())
+}
+
+/// Resolve without touching the filesystem, so a preview has no side effects.
+pub(crate) fn store_path(args: &[String], config: Option<&Config>) -> PathBuf {
+    value(args, "--store")
         .map(PathBuf::from)
         .or_else(|| env::var_os("SERVOLOOP_STORE").map(PathBuf::from))
         .or_else(|| config.and_then(|c| c.store.clone()))
-        .unwrap_or_else(default_store_path);
-    Store::open(p).map_err(|e| e.to_string())
+        .unwrap_or_else(default_store_path)
 }
 fn default_store_path() -> PathBuf {
     if cfg!(target_os = "windows") {

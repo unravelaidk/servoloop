@@ -7,13 +7,14 @@ mod execution;
 mod journal_tool;
 mod output;
 mod simulation;
+mod ui;
 
 use args::{config_action, validate_args, Cli};
 use clap::{error::ErrorKind, Parser};
 use std::{env, process::ExitCode};
 
 fn usage() {
-    eprintln!("usage: servoloop <run|resume|providers|models|config|sessions> [options]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  resume SESSION --prompt TEXT --provider ID --model ID [--store DIR]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
+    eprintln!("usage: servoloop <ui|run|resume|providers|models|config|sessions> [options]\n  ui [--theme dark|light|mono] [--store DIR]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  resume SESSION --prompt TEXT --provider ID --model ID [--store DIR]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
 }
 
 #[tokio::main]
@@ -66,6 +67,7 @@ async fn main() -> ExitCode {
         }
     };
     let result = match command.as_str() {
+        "ui" => ui::run(&args, cfg).await,
         "run" => execution::run(&args, &cfg).await,
         "resume" => execution::resume(&args, &cfg).await,
         "models" => commands::models(&args, &cfg).await,

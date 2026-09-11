@@ -152,6 +152,16 @@ Linux x86_64 (glibc 2.39), Windows x86_64, and macOS arm64 and x86_64. It does
 not publish releases yet. See [`docs/install.md`](docs/install.md) for manual
 artifact installation and verification.
 
+For the interactive offline-demo workspace, run from a clone in a terminal:
+
+```bash
+cargo run --locked -p servoloop-cli -- ui
+```
+
+Press Enter to review the demo, then `r` to run it. No model credentials or
+network connection are needed. See the [terminal UI guide](apps/servoloop-cli/README.md#interactive-terminal-workspace)
+for controls, themes, storage, and current limitations.
+
 From a clone, you can also install the current CLI into Cargo's user bin
 directory:
 

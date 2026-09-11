@@ -3,7 +3,7 @@ use crate::{
     commands::{provider, setting},
     config::{store, Config},
     journal_tool::JournalTool,
-    output::{emit, redact_value, redacted_session},
+    output::{redact_value, redacted_session, NdjsonOutput, RunOutput},
     simulation::{harness, DemoModel},
 };
 use serde_json::json;
@@ -13,15 +13,69 @@ use servoloop_store::{new_id, JournalRecord, SessionGuard, SCHEMA_VERSION};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
+pub(crate) const DEMO_PROMPT: &str = "Move the shoulder to 0.2 radians.";
+
+struct RunControl {
+    output: Arc<dyn RunOutput>,
+    stop: StopToken,
+    listen_for_signal: bool,
+}
+
+impl RunControl {
+    fn cli(args: &[String]) -> Self {
+        Self {
+            output: Arc::new(NdjsonOutput {
+                quiet: machine_output(args),
+            }),
+            stop: StopToken::new(),
+            listen_for_signal: true,
+        }
+    }
+}
+
+/// The terminal view supplies presentation and cancellation, not another
+/// execution engine. The demo always uses the existing scripted model and
+/// fresh simulator, irrespective of configured provider credentials.
+pub(crate) async fn interactive_demo(
+    args: &[String],
+    cfg: &Config,
+    output: Arc<dyn RunOutput>,
+    stop: StopToken,
+) -> Result<i32, String> {
+    run_loop(
+        args,
+        cfg,
+        Arc::new(DemoModel(Mutex::new(0))),
+        DEMO_PROMPT.into(),
+        true,
+        None,
+        RunControl {
+            output,
+            stop,
+            listen_for_signal: false,
+        },
+    )
+    .await
+}
+
 pub(crate) async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
     ensure_driver(args, cfg)?;
     let demo = has(args, "--demo");
     let prompt = if demo {
-        "Move the shoulder to 0.2 radians.".into()
+        DEMO_PROMPT.into()
     } else {
         prompt_from_args(args)?
     };
-    run_loop(args, cfg, model(args, cfg, demo)?, prompt, demo, None).await
+    run_loop(
+        args,
+        cfg,
+        model(args, cfg, demo)?,
+        prompt,
+        demo,
+        None,
+        RunControl::cli(args),
+    )
+    .await
 }
 
 fn ensure_driver(args: &[String], cfg: &Config) -> Result<(), String> {
@@ -89,6 +143,7 @@ pub(crate) async fn resume(args: &[String], cfg: &Config) -> Result<i32, String>
         prompt,
         has(args, "--demo"),
         Some((sid, guard, session)),
+        RunControl::cli(args),
     )
     .await
 }
@@ -100,13 +155,9 @@ async fn run_loop(
     prompt: String,
     simulated: bool,
     restored: Option<(String, Arc<SessionGuard>, servoloop_core::Session)>,
+    control: RunControl,
 ) -> Result<i32, String> {
-    if !machine_output(args) {
-        eprintln!(
-            "starting {} run",
-            if simulated { "simulated" } else { "provider" }
-        );
-    }
+    control.output.starting(simulated);
     let st = store(args, Some(cfg))?;
     let is_restored = restored.is_some();
     let (sid, guard, mut session) = match restored {
@@ -122,7 +173,9 @@ async fn run_loop(
         }
     };
     let mut seq = 0;
-    emit(&mut seq, &sid, "session_started", None)?;
+    control
+        .output
+        .emit(&mut seq, &sid, "session_started", None)?;
     let intent = JournalRecord {
         version: SCHEMA_VERSION,
         sequence: 0,
@@ -192,15 +245,17 @@ async fn run_loop(
             content: "Resume disclaimer: this is a fresh simulated environment. Prior robot observations are historical and are not current state; do not replay prior movement.".into(),
         });
     }
-    let stop = StopToken::new();
+    let stop = control.stop;
     let signal_stop = stop.clone();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_stop.stop();
-            true
-        } else {
-            false
-        }
+    let signal = control.listen_for_signal.then(|| {
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_stop.stop();
+                true
+            } else {
+                false
+            }
+        })
     });
     let event_seq = Arc::new(StdMutex::new(seq));
     let event_seq_sink = event_seq.clone();
@@ -211,7 +266,7 @@ async fn run_loop(
             &mut session,
             prompt,
             &|event: AgentEvent| {
-                if let Err(error) = emit(
+                if let Err(error) = control.output.emit(
                     &mut event_seq_sink.lock().expect("event sequence lock"),
                     &sid,
                     "agent_event",
@@ -224,7 +279,9 @@ async fn run_loop(
         )
         .await;
     let interrupted = stop.is_stopped();
-    signal.abort();
+    if let Some(signal) = signal {
+        signal.abort();
+    }
     let stop_error = if interrupted {
         // Keep emitting a terminal interrupted event even if the bounded
         // cleanup itself faults; a missing terminal event is unsafe for
@@ -244,7 +301,7 @@ async fn run_loop(
     if interrupted {
         // A stop racing the final model response is still an interrupted run:
         // never turn an action with uncertain timing into a success.
-        emit(
+        control.output.emit(
             &mut seq,
             &sid,
             "session_finished",
@@ -259,7 +316,7 @@ async fn run_loop(
             if let Err(error) = redacted_session(&session)
                 .and_then(|session| guard.save_snapshot(&session).map_err(|e| e.to_string()))
             {
-                emit(
+                control.output.emit(
                     &mut seq,
                     &sid,
                     "session_finished",
@@ -267,13 +324,13 @@ async fn run_loop(
                 )?;
                 return Err("failed to save session snapshot".into());
             }
-            emit(
+            control.output.emit(
                 &mut seq,
                 &sid,
                 "verified",
                 Some(json!({"simulated": simulated, "output": output})),
             )?;
-            emit(
+            control.output.emit(
                 &mut seq,
                 &sid,
                 "session_finished",
@@ -282,7 +339,7 @@ async fn run_loop(
             Ok(0)
         }
         Err(error) => {
-            emit(
+            control.output.emit(
                 &mut seq,
                 &sid,
                 "session_finished",

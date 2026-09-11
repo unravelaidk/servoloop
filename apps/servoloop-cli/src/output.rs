@@ -15,12 +15,43 @@ struct Event<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
 }
-pub(crate) fn emit(
-    seq: &mut u64,
-    sid: &str,
-    event: &str,
-    data: Option<Value>,
-) -> Result<(), String> {
+pub(crate) trait RunOutput: Send + Sync {
+    fn starting(&self, _simulated: bool) {}
+    fn emit(
+        &self,
+        seq: &mut u64,
+        sid: &str,
+        event: &str,
+        data: Option<Value>,
+    ) -> Result<(), String>;
+}
+
+pub(crate) struct NdjsonOutput {
+    pub(crate) quiet: bool,
+}
+
+impl RunOutput for NdjsonOutput {
+    fn starting(&self, simulated: bool) {
+        if !self.quiet {
+            eprintln!(
+                "starting {} run",
+                if simulated { "simulated" } else { "provider" }
+            );
+        }
+    }
+
+    fn emit(
+        &self,
+        seq: &mut u64,
+        sid: &str,
+        event: &str,
+        data: Option<Value>,
+    ) -> Result<(), String> {
+        emit(seq, sid, event, data)
+    }
+}
+
+fn emit(seq: &mut u64, sid: &str, event: &str, data: Option<Value>) -> Result<(), String> {
     *seq += 1;
     let value = serde_json::to_value(Event {
         version: 1,

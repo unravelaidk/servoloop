@@ -71,6 +71,32 @@ fn help_and_version_are_available() {
 }
 
 #[test]
+fn ui_help_and_theme_validation_do_not_require_a_terminal() {
+    let help = bin().args(["ui", "--help"]).output().unwrap();
+    assert!(help.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    assert!(text.contains("--theme"));
+    let invalid = bin().args(["ui", "--theme", "rainbow"]).output().unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+}
+
+#[test]
+fn ui_refuses_pipes_without_creating_a_session_or_emitting_ansi() {
+    let root = std::env::temp_dir().join(format!("servoloop-ui-no-tty-{}", std::process::id()));
+    assert!(!root.exists());
+    let out = bin().args(["ui", "--store"]).arg(&root).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.contains(&0x1b));
+    assert!(!root.exists());
+}
+
+#[test]
 fn config_init_is_atomic_and_never_clobbers() {
     let root = std::env::temp_dir().join(format!("servoloop-init-{}", std::process::id()));
     let _ = fs::remove_file(&root);
