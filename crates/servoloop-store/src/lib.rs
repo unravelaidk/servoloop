@@ -11,6 +11,7 @@
 //! `tempfile` crate's platform-specific atomic rename operation.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
@@ -84,6 +85,17 @@ impl SessionGuard {
             ));
         }
         self.store.append_locked(record, false)
+    }
+
+    /// Save a terminal session while retaining this execution lease. This is
+    /// the non-locking counterpart to `Store::save_snapshot`.
+    pub fn save_snapshot(&self, session: &servoloop_core::Session) -> Result<()> {
+        if session.id != self.session_id {
+            return Err(StoreError::InvalidJournal(
+                "snapshot session does not match session lease".into(),
+            ));
+        }
+        self.store.save_snapshot_locked(session)
     }
 }
 impl Drop for SessionGuard {
@@ -316,8 +328,12 @@ impl Store {
         )
     }
     pub fn save_snapshot(&self, session: &servoloop_core::Session) -> Result<()> {
-        Self::safe_id(&session.id)?;
         let _guard = self.acquire_session(&session.id)?;
+        _guard.save_snapshot(session)
+    }
+
+    fn save_snapshot_locked(&self, session: &servoloop_core::Session) -> Result<()> {
+        Self::safe_id(&session.id)?;
         if !self.unresolved(&session.id)?.is_empty()
             || session
                 .messages
@@ -391,13 +407,17 @@ impl Drop for FileLock {
     }
 }
 pub fn new_id(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{}-{}",
+        "{}-{}-{}-{}",
         prefix,
+        std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .as_nanos(),
+        counter
     )
 }
 

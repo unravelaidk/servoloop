@@ -106,9 +106,11 @@ fn stdin_prompt_is_bounded_and_empty_input_is_rejected() {
 #[test]
 fn demo_runs_real_loop_and_writes_journal() {
     let root = std::env::temp_dir().join(format!("servoloop-cli-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
     let out = bin()
         .args(["run", "--demo", "--store"])
         .arg(&root)
+        .args(["--session", "integration-session"])
         .output()
         .unwrap();
     assert!(
@@ -119,16 +121,36 @@ fn demo_runs_real_loop_and_writes_journal() {
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         serde_json::from_str::<serde_json::Value>(line).unwrap();
     }
-    let journal = fs::read_dir(&root)
+    let second = bin()
+        .args(["run", "--demo", "--store"])
+        .arg(&root)
+        .args(["--session", "integration-session"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let session_dir = root.join("integration-session");
+    let text = fs::read_to_string(session_dir.join("journal.ndjson")).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let intents: Vec<&str> = records
+        .iter()
+        .filter(|r| r["kind"] == "intent")
+        .map(|r| r["intent_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(intents.len(), 2);
+    assert_ne!(intents[0], intents[1]);
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(session_dir.join("snapshot.json")).unwrap()).unwrap();
+    assert!(!snapshot["session"]["messages"]
+        .as_array()
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .join("journal.ndjson");
-    let text = fs::read_to_string(journal).unwrap();
-    assert!(text.contains("\"kind\":\"intent\""));
-    assert!(text.contains("\"kind\":\"result\""));
+        .is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -193,7 +215,7 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
     let requests = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = requests.clone();
     let server = thread::spawn(move || {
-        for index in 0..2 {
+        for index in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
             let mut bytes = Vec::new();
             let mut buffer = [0_u8; 4096];
@@ -223,11 +245,11 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
             let body =
                 String::from_utf8_lossy(&bytes[header_end..header_end + length]).into_owned();
             seen.lock().unwrap().push(format!("{headers}{body}"));
-            let response = if index == 0 {
+            let response = if index < 2 {
                 let arguments =
-                    serde_json::json!({"command":"move_joint","joint":"shoulder","position":0.2})
+                    serde_json::json!({"command":"move_joint","joint":"shoulder","position":0.2 + index as f64 * 0.1})
                         .to_string();
-                serde_json::json!({"choices":[{"message":{"content":"moving","tool_calls":[{"id":"move-1","type":"function","function":{"name":"robot_command","arguments":arguments}}]},"finish_reason":"tool_calls"}]})
+                serde_json::json!({"choices":[{"message":{"content":"moving","tool_calls":[{"id":format!("move-{index}"),"type":"function","function":{"name":"robot_command","arguments":arguments}}]},"finish_reason":"tool_calls"}]})
             } else {
                 serde_json::json!({"choices":[{"message":{"content":"verified"},"finish_reason":"stop"}]})
             };
@@ -262,7 +284,7 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
         String::from_utf8_lossy(&out.stderr)
     );
     let captured = requests.lock().unwrap();
-    assert_eq!(captured.len(), 2);
+    assert_eq!(captured.len(), 3);
     assert!(captured.iter().all(|request| {
         request
             .to_ascii_lowercase()
@@ -270,6 +292,7 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
     }));
     assert!(captured[0].contains("move the shoulder"));
     assert!(captured[1].contains("simulator accepted command"));
+    assert!(captured[2].contains("simulator accepted command"));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(
@@ -290,8 +313,34 @@ fn live_run_uses_local_model_and_persists_verified_tool_action() {
         .path()
         .join("journal.ndjson");
     let journal_text = fs::read_to_string(journal).unwrap();
-    assert!(journal_text.contains("\"kind\":\"intent\""));
-    assert!(journal_text.contains("\"kind\":\"result\""));
+    let records: Vec<serde_json::Value> = journal_text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let intents: Vec<&str> = records
+        .iter()
+        .filter(|record| record["kind"] == "intent")
+        .map(|record| record["intent_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(intents.len(), 2);
+    assert_ne!(intents[0], intents[1]);
+    let snapshot: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fs::read_dir(&root)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+                .join("snapshot.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!snapshot["session"]["messages"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let _ = fs::remove_dir_all(root);
 }
 

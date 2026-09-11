@@ -12,7 +12,7 @@ use servoloop_robot::{
     CommandReceipt, JointLimit, JointLimitPolicy, RobotCommand, RobotDriver, RobotHarness,
     RobotState,
 };
-use servoloop_store::{new_id, JournalRecord, Store, SCHEMA_VERSION};
+use servoloop_store::{new_id, JournalRecord, SessionGuard, Store, SCHEMA_VERSION};
 use std::io::{self, IsTerminal, Read};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::{
@@ -109,6 +109,9 @@ struct SessionsArgs {
     store: Option<PathBuf>,
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Include the persisted terminal snapshot instead of only journal records.
+    #[arg(long)]
+    snapshot: bool,
 }
 
 #[derive(Serialize)]
@@ -153,8 +156,12 @@ fn redact(input: &str) -> String {
     }
     out
 }
-fn redact_value(value: Value) -> Value {
-    serde_json::from_str(&redact(&value.to_string())).unwrap_or(value)
+fn redact_value(value: Value) -> Result<Value, String> {
+    serde_json::from_str(&redact(&value.to_string())).map_err(|e| format!("redaction: {e}"))
+}
+fn redacted_session(session: &servoloop_core::Session) -> Result<servoloop_core::Session, String> {
+    let value = serde_json::to_value(session).map_err(|e| format!("session serialization: {e}"))?;
+    serde_json::from_value(redact_value(value)?).map_err(|e| format!("redacted session: {e}"))
 }
 fn safe_config(cfg: &Config) -> Value {
     let mut value = serde_json::to_value(cfg).unwrap_or(Value::Null);
@@ -237,7 +244,7 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             "--config",
         ],
         "config" => &["--config"],
-        "sessions" => &["--store", "--config"],
+        "sessions" => &["--store", "--config", "--snapshot"],
         "providers" => &[],
         _ => return Err(format!("unknown command `{command}`")),
     };
@@ -413,6 +420,7 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
     let st = store(args, Some(cfg))?;
     let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
     st.create_session(&sid).map_err(|e| e.to_string())?;
+    let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
     if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
         return Err("session has an unresolved intent; refusing to resume automatically".into());
     }
@@ -457,7 +465,7 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
     wrapped
         .register_arc(Arc::new(JournalTool {
             inner: command_tool,
-            store: st.clone(),
+            guard: guard.clone(),
             intent: intent.clone(),
         }))
         .map_err(|e| e.to_string())?;
@@ -490,6 +498,17 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
         .await;
     seq = *event_seq.lock().expect("event sequence lock");
     let output = result.map_err(|e| e.to_string())?;
+    if let Err(error) = redacted_session(&session)
+        .and_then(|session| guard.save_snapshot(&session).map_err(|e| e.to_string()))
+    {
+        emit(
+            &mut seq,
+            &sid,
+            "session_finished",
+            Some(json!({"outcome":"failed", "error":error})),
+        );
+        return Err("failed to save session snapshot".into());
+    }
     emit(
         &mut seq,
         &sid,
@@ -521,6 +540,7 @@ async fn run_loop(
     let st = store(args, Some(cfg))?;
     let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
     st.create_session(&sid).map_err(|e| e.to_string())?;
+    let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
     if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
         return Err("session has an unresolved intent; refusing to resume automatically".into());
     }
@@ -532,7 +552,7 @@ async fn run_loop(
         session_id: sid.clone(),
         intent_id: new_id("intent"),
         kind: "intent".into(),
-        arguments: redact_value(json!({"prompt": prompt})),
+        arguments: redact_value(json!({"prompt": prompt}))?,
         outcome: None,
     };
     let driver = Arc::new(SimulatedDriver(Mutex::new(RobotState {
@@ -565,7 +585,7 @@ async fn run_loop(
     wrapped
         .register_arc(Arc::new(JournalTool {
             inner: command_tool,
-            store: st.clone(),
+            guard: guard.clone(),
             intent,
         }))
         .map_err(|e| e.to_string())?;
@@ -659,6 +679,17 @@ async fn run_loop(
     }
     match run_result {
         Ok(output) => {
+            if let Err(error) = redacted_session(&session)
+                .and_then(|session| guard.save_snapshot(&session).map_err(|e| e.to_string()))
+            {
+                emit(
+                    &mut seq,
+                    &sid,
+                    "session_finished",
+                    Some(json!({"outcome":"failed", "error":error})),
+                );
+                return Err("failed to save session snapshot".into());
+            }
             emit(
                 &mut seq,
                 &sid,
@@ -741,7 +772,7 @@ impl Model for DemoModel {
 
 struct JournalTool {
     inner: Arc<dyn Tool>,
-    store: Store,
+    guard: Arc<SessionGuard>,
     intent: JournalRecord,
 }
 #[async_trait]
@@ -753,8 +784,9 @@ impl Tool for JournalTool {
     }
     async fn execute(&self, args: Value) -> CoreResult<ToolOutput> {
         let mut intent = self.intent.clone();
-        intent.arguments = redact_value(args.clone());
-        self.store.append(intent.clone()).map_err(|e| {
+        intent.intent_id = new_id("intent");
+        intent.arguments = redact_value(args.clone()).map_err(servoloop_core::Error::Tool)?;
+        self.guard.append(intent.clone()).map_err(|e| {
             servoloop_core::Error::Tool(format!("journal failed; motion not dispatched: {e}"))
         })?;
         match self.inner.execute(args).await {
@@ -762,7 +794,7 @@ impl Tool for JournalTool {
                 let mut done = intent;
                 done.kind = "result".into();
                 done.outcome = Some("verified".into());
-                self.store
+                self.guard
                     .append(done)
                     .map_err(|e| servoloop_core::Error::Tool(e.to_string()))?;
                 Ok(out)
@@ -774,7 +806,7 @@ impl Tool for JournalTool {
                 // operator reconciles the robot state.
                 failed.kind = "result".into();
                 failed.outcome = None;
-                let _ = self.store.append(failed);
+                let _ = self.guard.append(failed);
                 Err(e)
             }
         }
@@ -911,13 +943,23 @@ fn sessions(args: &[String], cfg: &Config) -> Result<(), String> {
         Some("list") | None => println!("{}", json!(st.sessions().map_err(|e| e.to_string())?)),
         Some("show") => println!(
             "{}",
-            redact(
-                &serde_json::to_string(
-                    &st.records(args.get(2).ok_or("session ID required")?)
-                        .map_err(|e| e.to_string())?
+            if has(args, "--snapshot") {
+                redact(
+                    &serde_json::to_string(
+                        &st.load_snapshot(args.get(2).ok_or("session ID required")?)
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .unwrap(),
                 )
-                .unwrap()
-            )
+            } else {
+                redact(
+                    &serde_json::to_string(
+                        &st.records(args.get(2).ok_or("session ID required")?)
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .unwrap(),
+                )
+            }
         ),
         Some("delete") => {
             st.delete(args.get(2).ok_or("session ID required")?)
@@ -986,6 +1028,7 @@ mod cancellation_tests {
         let store = Store::open(&root).unwrap();
         let sid = "cancel-session";
         store.create_session(sid).unwrap();
+        let guard = Arc::new(store.acquire_session(sid).unwrap());
         let ready = Arc::new(Notify::new());
         let tool = Arc::new(ReadyThenHang {
             ready: ready.clone(),
@@ -1005,7 +1048,7 @@ mod cancellation_tests {
         tools
             .register_arc(Arc::new(JournalTool {
                 inner: tool.clone(),
-                store: store.clone(),
+                guard,
                 intent,
             }))
             .unwrap();
