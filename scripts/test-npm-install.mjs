@@ -6,6 +6,12 @@ import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const run = promisify(execFile);
+// Windows package-manager shims are batch files, not native executables.
+// All arguments here are controlled smoke-test paths and fixed CLI options.
+const runShim = (command, args, options = {}) => run(command, args, {
+  ...options,
+  shell: process.platform === 'win32',
+});
 const [, , binary, version = '0.1.0', target] = process.argv;
 if (!binary || !target) throw new Error('usage: node scripts/test-npm-install.mjs BINARY VERSION TARGET');
 const root = resolve(import.meta.dirname, '..');
@@ -25,21 +31,25 @@ try {
   const dist = join(root, 'dist/npm');
   const launcherTarball = join(dist, `servoloop-${version}.tgz`);
   const nativeTarball = join(dist, `${nativeName}-${version}.tgz`);
-  const fixture = join(tmp, 'fixture'); await mkdir(join(fixture, 'bin'), { recursive: true });
-  const launcher = JSON.parse(await readFile(join(root, 'packages/servoloop/package.json'), 'utf8'));
+  const unpack = join(tmp, 'unpack'); await mkdir(unpack);
+  await run('tar', ['-xzf', launcherTarball, '-C', unpack]);
+  const fixture = join(unpack, 'package');
+  const launcher = JSON.parse(await readFile(join(fixture, 'package.json'), 'utf8'));
+  if (Object.values(launcher.optionalDependencies).some(value => value !== version)) {
+    throw new Error('shipped launcher must use matching exact dependency versions');
+  }
   launcher.version = version;
   launcher.optionalDependencies = { [nativeName]: `file:${nativeTarball}` };
   await writeFile(join(fixture, 'package.json'), JSON.stringify(launcher, null, 2) + '\n');
-  await cp(join(root, 'packages/servoloop/bin/servoloop.mjs'), join(fixture, 'bin/servoloop.mjs'));
   const packed = (await run(npmCommand[0], [...npmCommand.slice(1), 'pack', '--ignore-scripts', '--pack-destination', fixture], { cwd: fixture })).stdout.trim().split(/\r?\n/).pop();
   const home = join(tmp, 'home'); const store = join(tmp, 'store'); const globalDir = join(tmp, 'global'); const bin = join(tmp, 'bin');
   await mkdir(bin, { recursive: true });
   const env = { ...process.env, HOME: home, PNPM_HOME: join(tmp, 'pnpm-home'), PATH: `${bin}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH || ''}` };
-  await run(pnpm, ['add', '--global', '--ignore-scripts', '--offline', '--store-dir', store, '--global-dir', globalDir, '--global-bin-dir', bin, join(fixture, packed)], { cwd: root, env });
+  await runShim(pnpm, ['add', '--global', '--ignore-scripts', '--offline', '--store-dir', store, '--global-dir', globalDir, '--global-bin-dir', bin, join(fixture, packed)], { cwd: root, env });
   const command = process.platform === 'win32' ? join(bin, 'servoloop.cmd') : join(bin, 'servoloop');
-  await run(command, ['--version'], { env });
-  await run(command, ['--help'], { env });
-  await run(command, ['run', '--demo', '--store', join(tmp, 'demo-store')], { env, stdio: 'pipe' });
-  try { await run(command, ['invalid-subcommand'], { env }); throw new Error('invalid arguments unexpectedly succeeded'); } catch (error) { if (error.message.includes('unexpectedly succeeded')) throw error; }
+  await runShim(command, ['--version'], { env });
+  await runShim(command, ['--help'], { env });
+  await runShim(command, ['run', '--demo', '--store', join(tmp, 'demo-store')], { env, stdio: 'pipe' });
+  try { await runShim(command, ['invalid-subcommand'], { env }); throw new Error('invalid arguments unexpectedly succeeded'); } catch (error) { if (error.message.includes('unexpectedly succeeded')) throw error; }
   console.log('pnpm npm-package smoke test passed');
 } finally { await rm(tmp, { recursive: true, force: true }); }
