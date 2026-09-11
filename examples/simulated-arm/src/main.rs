@@ -49,6 +49,7 @@ impl Model for DemoModel {
                     name: "robot_observe".into(),
                     arguments: json!({}),
                 }],
+                ..Default::default()
             },
             1 => ModelResponse {
                 content: "The requested move is within the configured step limit.".into(),
@@ -61,11 +62,9 @@ impl Model for DemoModel {
                         "position": 0.2
                     }),
                 }],
+                ..Default::default()
             },
-            2 => ModelResponse {
-                content: "The simulated shoulder moved to 0.2 radians.".into(),
-                tool_calls: vec![],
-            },
+            2 => ModelResponse::text("The simulated shoulder moved to 0.2 radians."),
             _ => return Err(Error::Model("demo script exhausted".into())),
         };
         *turn += 1;
