@@ -122,9 +122,15 @@ fn demo_runs_real_loop_and_writes_journal() {
         serde_json::from_str::<serde_json::Value>(line).unwrap();
     }
     let second = bin()
-        .args(["run", "--demo", "--store"])
+        .args([
+            "resume",
+            "integration-session",
+            "--demo",
+            "--prompt",
+            "continue",
+            "--store",
+        ])
         .arg(&root)
-        .args(["--session", "integration-session"])
         .output()
         .unwrap();
     assert!(

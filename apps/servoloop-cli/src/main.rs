@@ -46,6 +46,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Run(RunArgs),
+    Resume(ResumeArgs),
     Models(ModelsArgs),
     Providers,
     Config(ConfigArgs),
@@ -80,6 +81,24 @@ struct RunArgs {
     prompt: Option<String>,
     #[arg(long)]
     session: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    max_turns: usize,
+    #[arg(long, value_name = "SECONDS")]
+    model_timeout: Option<u64>,
+    #[arg(long, value_name = "SECONDS")]
+    tool_timeout: Option<u64>,
+}
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    session: String,
+    #[arg(long)]
+    demo: bool,
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+    #[arg(long)]
+    driver: Option<String>,
     #[arg(long, default_value_t = 50)]
     max_turns: usize,
     #[arg(long, value_name = "SECONDS")]
@@ -201,7 +220,7 @@ fn init_config(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 fn usage() {
-    eprintln!("usage: servoloop <run|providers|models|config|sessions> [options]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
+    eprintln!("usage: servoloop <run|resume|providers|models|config|sessions> [options]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  resume SESSION --prompt TEXT --provider ID --model ID [--store DIR]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
 }
 fn value(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
@@ -235,6 +254,19 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             "--max-turns",
             "--model-timeout",
             "--tool-timeout",
+        ],
+        "resume" => &[
+            "--store",
+            "--provider",
+            "--model",
+            "--base-url",
+            "--config",
+            "--prompt",
+            "--driver",
+            "--max-turns",
+            "--model-timeout",
+            "--tool-timeout",
+            "--demo",
         ],
         "models" => &[
             "--provider",
@@ -415,10 +447,13 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
         let prompt = prompt_from_args(args)?;
         let model: Arc<dyn Model> =
             Arc::new(OpenAiCompatProvider::new(spec, model).map_err(|e| e.to_string())?);
-        return run_loop(args, cfg, model, prompt, false).await;
+        return run_loop(args, cfg, model, prompt, false, None).await;
     }
     let st = store(args, Some(cfg))?;
     let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
+    if st.sessions().map_err(|e| e.to_string())?.contains(&sid) {
+        return Err("session already exists; use `resume` to continue it".into());
+    }
     st.create_session(&sid).map_err(|e| e.to_string())?;
     let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
     if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
@@ -524,12 +559,72 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
     Ok(0)
 }
 
+async fn resume(args: &[String], cfg: &Config) -> Result<i32, String> {
+    if value(args, "--driver")
+        .or_else(|| cfg.driver.clone())
+        .as_deref()
+        .unwrap_or("simulated")
+        != "simulated"
+    {
+        return Err("only the simulated driver is implemented; Isaac is not available".into());
+    }
+    let sid = args.get(1).ok_or("session ID is required")?.clone();
+    let st = store(args, Some(cfg))?;
+    if !st.sessions().map_err(|e| e.to_string())?.contains(&sid) {
+        return Err("session not found".into());
+    }
+    // Acquire before loading either the journal or snapshot. The guard remains
+    // alive through the complete run and terminal snapshot write.
+    let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
+    let session = st
+        .load_snapshot_guarded(&guard)
+        .map_err(|e| format!("cannot resume session: {e}"))?;
+    if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
+        return Err("session has unresolved tool outcomes; refusing to resume".into());
+    }
+    let prompt = prompt_from_args(args)?;
+    let model: Arc<dyn Model> = if has(args, "--demo") {
+        Arc::new(DemoModel(Mutex::new(0)))
+    } else {
+        let name = setting(
+            args,
+            "--provider",
+            "SERVOLOOP_PROVIDER",
+            cfg.provider.clone(),
+        )
+        .ok_or("--provider is required")?;
+        let model_name = setting(args, "--model", "SERVOLOOP_MODEL", cfg.model.clone())
+            .ok_or("--model is required")?;
+        let spec = provider(
+            &name,
+            setting(
+                args,
+                "--base-url",
+                "SERVOLOOP_BASE_URL",
+                cfg.base_url.clone(),
+            ),
+        )?;
+        spec.validate().map_err(|e| format!("provider: {e}"))?;
+        Arc::new(OpenAiCompatProvider::new(spec, model_name).map_err(|e| e.to_string())?)
+    };
+    run_loop(
+        args,
+        cfg,
+        model,
+        prompt,
+        has(args, "--demo"),
+        Some((sid, guard, session)),
+    )
+    .await
+}
+
 async fn run_loop(
     args: &[String],
     cfg: &Config,
     model: Arc<dyn Model>,
     prompt: String,
     simulated: bool,
+    restored: Option<(String, Arc<SessionGuard>, servoloop_core::Session)>,
 ) -> Result<i32, String> {
     if !machine_output(args) {
         eprintln!(
@@ -538,12 +633,19 @@ async fn run_loop(
         );
     }
     let st = store(args, Some(cfg))?;
-    let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
-    st.create_session(&sid).map_err(|e| e.to_string())?;
-    let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
-    if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
-        return Err("session has an unresolved intent; refusing to resume automatically".into());
-    }
+    let is_restored = restored.is_some();
+    let (sid, guard, mut session) = match restored {
+        Some((sid, guard, session)) => (sid, guard, session),
+        None => {
+            let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
+            if st.sessions().map_err(|e| e.to_string())?.contains(&sid) {
+                return Err("session already exists; use `resume` to continue it".into());
+            }
+            st.create_session(&sid).map_err(|e| e.to_string())?;
+            let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
+            (sid.clone(), guard, servoloop_core::Session::new(&sid))
+        }
+    };
     let mut seq = 0;
     emit(&mut seq, &sid, "session_started", None);
     let intent = JournalRecord {
@@ -621,7 +723,18 @@ async fn run_loop(
         "Operate the robot conservatively; verify every action.",
     )
     .with_config(loop_config);
-    let mut session = servoloop_core::Session::new(&sid);
+    if session
+        .messages
+        .iter()
+        .any(|m| matches!(m, servoloop_core::Message::ToolUnknown { .. }))
+    {
+        return Err("session has unresolved ToolUnknown results; refusing to resume".into());
+    }
+    if !session.messages.is_empty() && is_restored {
+        session.messages.push(servoloop_core::Message::System {
+            content: "Resume disclaimer: this is a fresh simulated environment. Prior robot observations are historical and are not current state; do not replay prior movement.".into(),
+        });
+    }
     let stop = StopToken::new();
     let signal_stop = stop.clone();
     let signal = tokio::spawn(async move {
@@ -742,13 +855,14 @@ impl RobotDriver for SimulatedDriver {
 struct DemoModel(Mutex<u8>);
 #[async_trait]
 impl Model for DemoModel {
-    async fn complete(&self, _request: ModelRequest) -> CoreResult<ModelResponse> {
+    async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
         let mut n = self.0.lock().await;
+        let suffix = request.messages.len();
         let response = match *n {
             0 => ModelResponse {
                 content: "Inspecting first.".into(),
                 tool_calls: vec![ToolCall {
-                    id: "observe-1".into(),
+                    id: format!("observe-{suffix}"),
                     name: "robot_observe".into(),
                     arguments: json!({}),
                 }],
@@ -757,7 +871,7 @@ impl Model for DemoModel {
             1 => ModelResponse {
                 content: "Making the requested small move.".into(),
                 tool_calls: vec![ToolCall {
-                    id: "move-1".into(),
+                    id: format!("move-{suffix}"),
                     name: "robot_command".into(),
                     arguments: json!({"command":"move_joint","joint":"shoulder","position":0.2}),
                 }],
@@ -871,6 +985,7 @@ async fn main() -> ExitCode {
     };
     let result: Result<i32, String> = match command.as_str() {
         "run" => run(&args, &cfg).await,
+        "resume" => resume(&args, &cfg).await,
         "models" => models(&args, &cfg).await,
         "config" => match config_action(&args) {
             "init" => init_config(&args).map(|_| 0),
