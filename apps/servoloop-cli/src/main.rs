@@ -1,10 +1,11 @@
 //! `servoloop`: a deliberately small machine-oriented operator CLI.
 use async_trait::async_trait;
+use clap::{error::ErrorKind, Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use servoloop_core::{
-    AgentLoop, Event as AgentEvent, Model, ModelRequest, ModelResponse, Result as CoreResult,
-    StopToken, Tool, ToolCall, ToolOutput, ToolRegistry,
+    AgentLoop, Event as AgentEvent, LoopConfig, Model, ModelRequest, ModelResponse,
+    Result as CoreResult, StopToken, Tool, ToolCall, ToolOutput, ToolRegistry,
 };
 use servoloop_providers::{Discovery, DiscoveryOptions, OpenAiCompatProvider, ProviderSpec};
 use servoloop_robot::{
@@ -12,6 +13,7 @@ use servoloop_robot::{
     RobotState,
 };
 use servoloop_store::{new_id, JournalRecord, Store, SCHEMA_VERSION};
+use std::io::{self, IsTerminal, Read};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::{
     collections::BTreeMap,
@@ -31,6 +33,82 @@ struct Config {
     base_url: Option<String>,
     store: Option<PathBuf>,
     driver: Option<String>,
+}
+
+/// Typed front-end for the operator CLI. The execution layer still receives
+/// the original argv so this remains compatible with existing integrations.
+#[derive(Debug, Parser)]
+#[command(name = "servoloop", version, about = "ServoLoop robot operator CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+#[derive(Debug, Subcommand)]
+enum Command {
+    Run(RunArgs),
+    Models(ModelsArgs),
+    Providers,
+    Config(ConfigArgs),
+    Sessions(SessionsArgs),
+}
+#[derive(Debug, Args)]
+struct CommonArgs {
+    #[arg(long)]
+    store: Option<PathBuf>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = ["ndjson", "json"])]
+    output: Option<String>,
+}
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    demo: bool,
+    #[arg(long)]
+    driver: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    max_turns: usize,
+    #[arg(long, value_name = "SECONDS")]
+    model_timeout: Option<u64>,
+    #[arg(long, value_name = "SECONDS")]
+    tool_timeout: Option<u64>,
+}
+#[derive(Debug, Args)]
+struct ModelsArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long)]
+    offline: bool,
+}
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[arg(default_value = "show")]
+    action: String,
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+#[derive(Debug, Args)]
+struct SessionsArgs {
+    action: Option<String>,
+    id: Option<String>,
+    #[arg(long)]
+    store: Option<PathBuf>,
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +174,25 @@ fn safe_config(cfg: &Config) -> Value {
     }
     value
 }
+fn init_config(args: &[String]) -> Result<(), String> {
+    let path = value(args, "--config")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_path);
+    if path.exists() {
+        return Err(format!("config already exists: {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("config: {e}"))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, b"{\n  \"version\": 1\n}\n").map_err(|e| format!("config: {e}"))?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("config: {e}"));
+    }
+    println!("{}", path.display());
+    Ok(())
+}
 fn usage() {
     eprintln!("usage: servoloop <run|providers|models|config|sessions> [options]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
 }
@@ -104,6 +201,16 @@ fn value(args: &[String], name: &str) -> Option<String> {
 }
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+fn machine_output(args: &[String]) -> bool {
+    has(args, "--json") || value(args, "--output").as_deref() == Some("json")
+}
+fn config_action(args: &[String]) -> &str {
+    args.iter()
+        .skip(1)
+        .find(|arg| matches!(arg.as_str(), "init" | "validate" | "show"))
+        .map(String::as_str)
+        .unwrap_or("show")
 }
 fn validate_args(args: &[String]) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("");
@@ -118,6 +225,9 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             "--base-url",
             "--config",
             "--prompt",
+            "--max-turns",
+            "--model-timeout",
+            "--tool-timeout",
         ],
         "models" => &[
             "--provider",
@@ -140,6 +250,9 @@ fn validate_args(args: &[String]) -> Result<(), String> {
         "--base-url",
         "--config",
         "--prompt",
+        "--max-turns",
+        "--model-timeout",
+        "--tool-timeout",
     ];
     let mut i = 1;
     while i < args.len() {
@@ -148,7 +261,8 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             return Err(format!("unknown option `{a}`"));
         }
         if value_flags.contains(&a.as_str()) {
-            if args.get(i + 1).is_none() || args[i + 1].starts_with('-') {
+            let stdin_prompt = a == "--prompt" && args.get(i + 1).map(String::as_str) == Some("-");
+            if args.get(i + 1).is_none() || (args[i + 1].starts_with('-') && !stdin_prompt) {
                 return Err(format!("{a} requires a value"));
             }
             i += 1;
@@ -162,17 +276,49 @@ fn store(args: &[String], config: Option<&Config>) -> Result<Store, String> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("SERVOLOOP_STORE").map(PathBuf::from))
         .or_else(|| config.and_then(|c| c.store.clone()))
-        .unwrap_or_else(|| PathBuf::from(".servoloop"));
+        .unwrap_or_else(default_store_path);
     Store::open(p).map_err(|e| e.to_string())
 }
+fn default_store_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("ServoLoop")
+            .join("store")
+    } else {
+        env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("servoloop")
+    }
+}
+fn default_config_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("ServoLoop/config.json")
+    } else {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("servoloop/config.json")
+    }
+}
 fn load_config(args: &[String]) -> Result<Config, String> {
+    let explicit = value(args, "--config").is_some() || env::var_os("SERVOLOOP_CONFIG").is_some();
     let path = value(args, "--config")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("SERVOLOOP_CONFIG").map(PathBuf::from));
-    let Some(path) = path else {
-        return Ok(Config::default());
+        .or_else(|| env::var_os("SERVOLOOP_CONFIG").map(PathBuf::from))
+        .unwrap_or_else(default_config_path);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if !explicit && e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(format!("config: {e}")),
     };
-    let text = fs::read_to_string(path).map_err(|e| format!("config: {e}"))?;
     let c: Config = serde_json::from_str(&text).map_err(|e| format!("config must be JSON: {e}"))?;
     if c.version != Some(1) {
         return Err(format!(
@@ -181,6 +327,31 @@ fn load_config(args: &[String]) -> Result<Config, String> {
         ));
     }
     Ok(c)
+}
+
+fn prompt_from_args(args: &[String]) -> Result<String, String> {
+    const MAX_STDIN_PROMPT_BYTES: u64 = 1024 * 1024;
+    let prompt = value(args, "--prompt").ok_or("--prompt is required for live runs")?;
+    if prompt != "-" {
+        return Ok(prompt);
+    }
+    if io::stdin().is_terminal() {
+        return Err("--prompt - reads stdin; refusing interactive terminal input".into());
+    }
+    let mut text = String::new();
+    io::stdin()
+        .take(MAX_STDIN_PROMPT_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("stdin: {e}"))?;
+    if text.len() as u64 > MAX_STDIN_PROMPT_BYTES {
+        return Err(format!(
+            "stdin prompt exceeds {MAX_STDIN_PROMPT_BYTES} bytes"
+        ));
+    }
+    if text.trim().is_empty() {
+        return Err("stdin prompt is empty".into());
+    }
+    Ok(text)
 }
 fn provider(name: &str, base: Option<String>) -> Result<ProviderSpec, String> {
     let p = match name {
@@ -234,7 +405,7 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
             ),
         )?;
         spec.validate().map_err(|e| format!("provider: {e}"))?;
-        let prompt = value(args, "--prompt").ok_or("--prompt is required for live runs")?;
+        let prompt = prompt_from_args(args)?;
         let model: Arc<dyn Model> =
             Arc::new(OpenAiCompatProvider::new(spec, model).map_err(|e| e.to_string())?);
         return run_loop(args, cfg, model, prompt, false).await;
@@ -341,6 +512,12 @@ async fn run_loop(
     prompt: String,
     simulated: bool,
 ) -> Result<i32, String> {
+    if !machine_output(args) {
+        eprintln!(
+            "starting {} run",
+            if simulated { "simulated" } else { "provider" }
+        );
+    }
     let st = store(args, Some(cfg))?;
     let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
     st.create_session(&sid).map_err(|e| e.to_string())?;
@@ -395,11 +572,35 @@ async fn run_loop(
     if let Some(observe) = tools.get("robot_observe") {
         wrapped.register_arc(observe).map_err(|e| e.to_string())?;
     }
+    let mut loop_config = LoopConfig::default();
+    if let Some(turns) = value(args, "--max-turns") {
+        loop_config.max_turns = turns
+            .parse()
+            .map_err(|_| "--max-turns must be a positive integer")?;
+        if loop_config.max_turns == 0 {
+            return Err("--max-turns must be greater than zero".into());
+        }
+    }
+    if let Some(seconds) = value(args, "--model-timeout") {
+        loop_config.model_deadline = Some(std::time::Duration::from_secs(
+            seconds
+                .parse()
+                .map_err(|_| "--model-timeout must be seconds")?,
+        ));
+    }
+    if let Some(seconds) = value(args, "--tool-timeout") {
+        loop_config.tool_deadline = Some(std::time::Duration::from_secs(
+            seconds
+                .parse()
+                .map_err(|_| "--tool-timeout must be seconds")?,
+        ));
+    }
     let agent = AgentLoop::new(
         model,
         wrapped,
         "Operate the robot conservatively; verify every action.",
-    );
+    )
+    .with_config(loop_config);
     let mut session = servoloop_core::Session::new(&sid);
     let stop = StopToken::new();
     let signal_stop = stop.clone();
@@ -582,13 +783,31 @@ impl Tool for JournalTool {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || has(&args, "--help") {
-        usage();
-        return ExitCode::from(if args.is_empty() { 2 } else { 0 });
+    // A lone `-` is a meaningful prompt value (stdin), but clap otherwise
+    // treats it as the beginning of another option.
+    let mut parse_args = args.clone();
+    for i in 0..parse_args.len().saturating_sub(1) {
+        if parse_args[i] == "--prompt" && parse_args[i + 1] == "-" {
+            parse_args[i] = "--prompt=-".into();
+            parse_args.remove(i + 1);
+            break;
+        }
     }
-    if has(&args, "--version") {
-        println!("servoloop {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+    let parse = std::iter::once(String::from("servoloop")).chain(parse_args);
+    if let Err(error) = Cli::try_parse_from(parse) {
+        let code = match error.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+            _ => 2,
+        };
+        let rendered = error
+            .to_string()
+            .replace("unexpected argument", "unknown option");
+        eprint!("{rendered}");
+        return ExitCode::from(code);
+    }
+    if args.is_empty() {
+        usage();
+        return ExitCode::from(2);
     }
     let command = &args[0];
     if let Err(e) = validate_args(&args) {
@@ -602,6 +821,15 @@ async fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
+    if command == "config" && config_action(&args) == "init" {
+        return match init_config(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let cfg = match load_config(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -612,10 +840,18 @@ async fn main() -> ExitCode {
     let result: Result<i32, String> = match command.as_str() {
         "run" => run(&args, &cfg).await,
         "models" => models(&args, &cfg).await,
-        "config" => {
-            println!("{}", redact(&safe_config(&cfg).to_string()));
-            Ok(0)
-        }
+        "config" => match config_action(&args) {
+            "init" => init_config(&args).map(|_| 0),
+            "validate" => {
+                println!("valid");
+                Ok(0)
+            }
+            "show" => {
+                println!("{}", redact(&safe_config(&cfg).to_string()));
+                Ok(0)
+            }
+            action => Err(format!("unknown config action `{action}`")),
+        },
         "sessions" => sessions(&args, &cfg).map(|_| 0),
         _ => {
             usage();

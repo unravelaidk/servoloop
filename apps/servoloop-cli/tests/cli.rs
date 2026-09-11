@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
 };
@@ -15,6 +15,92 @@ fn bin() -> Command {
 fn help_and_version_are_available() {
     assert!(bin().arg("--help").output().unwrap().status.success());
     assert!(bin().arg("--version").output().unwrap().status.success());
+    assert!(bin()
+        .args(["run", "--help"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(bin()
+        .args(["config", "--help"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+}
+
+#[test]
+fn config_init_is_atomic_and_never_clobbers() {
+    let root = std::env::temp_dir().join(format!("servoloop-init-{}", std::process::id()));
+    let _ = fs::remove_file(&root);
+    let out = bin()
+        .args(["config", "init", "--config"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let original = fs::read_to_string(&root).unwrap();
+    let out = bin()
+        .args(["config", "init", "--config"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&root).unwrap(), original);
+    let _ = fs::remove_file(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_init_does_not_follow_destination_symlink() {
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!("servoloop-link-{}", std::process::id()));
+    let target = std::env::temp_dir().join(format!("servoloop-target-{}", std::process::id()));
+    let _ = fs::remove_file(&root);
+    let _ = fs::remove_file(&target);
+    fs::write(&target, b"keep").unwrap();
+    symlink(&target, &root).unwrap();
+    let out = bin()
+        .args(["config", "init", "--config"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    let _ = fs::remove_file(root);
+    let _ = fs::remove_file(target);
+}
+
+#[test]
+fn stdin_prompt_is_bounded_and_empty_input_is_rejected() {
+    let mut child = bin()
+        .args([
+            "run",
+            "--prompt",
+            "-",
+            "--provider",
+            "ollama",
+            "--model",
+            "local",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&vec![b'x'; 1024 * 1024 + 1])
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("exceeds"));
 }
 
 #[test]
