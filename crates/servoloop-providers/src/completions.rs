@@ -185,10 +185,12 @@ impl OpenAiCompatProvider {
         let reasoning = extract_reasoning_text(message).map(|text| Reasoning { text: Some(text) });
 
         // Parse tool calls — reject invalid JSON and non-object arguments.
-        let tool_calls: Vec<servoloop_core::ToolCall> = message
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .map(|calls| {
+        let tool_calls: Vec<servoloop_core::ToolCall> = match message.get("tool_calls") {
+            None => Vec::new(),
+            Some(calls) => {
+                let calls = calls.as_array().ok_or_else(|| {
+                    ProviderError::malformed("message tool_calls must be an array")
+                })?;
                 let mut result = Vec::with_capacity(calls.len());
                 for call in calls {
                     match parse_tool_call(call) {
@@ -204,22 +206,31 @@ impl OpenAiCompatProvider {
                                 json_type(&parsed)
                             )));
                         }
-                        None => {}
+                        Some(ParsedToolCall::Malformed) => {
+                            return Err(ProviderError::malformed(
+                                "tool call is missing a string id, function, or function name",
+                            ));
+                        }
+                        None => {
+                            return Err(ProviderError::malformed(
+                                "tool call is missing a string id, function, or function name",
+                            ));
+                        }
                     }
                 }
-                Ok(result)
-            })
-            .transpose()?
-            .unwrap_or_default();
+                result
+            }
+        };
 
         let usage = parse_usage(body);
 
-        let finish_reason = parse_finish_reason(
-            choice
-                .get("finish_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stop"),
-        );
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .map(parse_finish_reason)
+            .ok_or_else(|| {
+                ProviderError::malformed("completion did not include a finish reason")
+            })?;
 
         Ok(ModelResponse {
             content,
@@ -261,6 +272,8 @@ fn extract_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
 /// why the call was rejected.
 enum ParsedToolCall {
     Ok(servoloop_core::ToolCall),
+    /// Required wire shape is missing or has the wrong type.
+    Malformed,
     /// Arguments are not valid JSON.
     InvalidArgumentsJson {
         id: String,
@@ -283,9 +296,18 @@ enum ParsedToolCall {
 /// [`ProviderError`] — invalid tool calls are **never** silently
 /// repaired, defaulted, or string-fallbacked.
 fn parse_tool_call(call: &serde_json::Value) -> Option<ParsedToolCall> {
-    let id = call.get("id").and_then(|v| v.as_str())?.to_string();
-    let function = call.get("function")?;
-    let name = function.get("name").and_then(|v| v.as_str())?.to_string();
+    let id = match call.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return Some(ParsedToolCall::Malformed),
+    };
+    let function = match call.get("function") {
+        Some(function) => function,
+        None => return Some(ParsedToolCall::Malformed),
+    };
+    let name = match function.get("name").and_then(|v| v.as_str()) {
+        Some(name) => name.to_string(),
+        None => return Some(ParsedToolCall::Malformed),
+    };
     let arguments_value = match function.get("arguments") {
         Some(arguments) => arguments,
         None => {
@@ -402,6 +424,11 @@ fn json_type(v: &serde_json::Value) -> &'static str {
 /// - Empty arguments (assembler fallback to `Value::Null`).
 fn validate_tool_call_arguments(response: &ModelResponse) -> ProviderResult<()> {
     for call in &response.tool_calls {
+        if call.id.is_empty() || call.name.is_empty() {
+            return Err(ProviderError::invalid(
+                "tool call is missing a non-empty id or function name",
+            ));
+        }
         if !call.arguments.is_object() {
             return Err(ProviderError::invalid(format!(
                 "tool call `{}` (`{}`) arguments must be a JSON object, got `{}`",
@@ -501,7 +528,7 @@ impl Model for OpenAiCompatProvider {
         }
 
         // SSE stream processing.
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut total_bytes = 0usize;
         let mut assembler = servoloop_core::StreamAssembler::new();
         let mut finish_reason: Option<FinishReason> = None;
@@ -509,7 +536,8 @@ impl Model for OpenAiCompatProvider {
         use futures_util::StreamExt;
         let mut stream = response.bytes_stream();
 
-        while let Some(chunk) = stream.next().await {
+        let mut saw_done = false;
+        'chunks: while let Some(chunk) = stream.next().await {
             let chunk =
                 chunk.map_err(|e| ProviderError::transient(format!("stream chunk error: {e}")))?;
 
@@ -517,13 +545,25 @@ impl Model for OpenAiCompatProvider {
 
             for event in events {
                 if is_done(&event.data) {
-                    continue;
+                    if finish_reason.is_none() {
+                        return Err(ProviderError::malformed(
+                            "SSE stream ended with [DONE] but no finish reason",
+                        )
+                        .into());
+                    }
+                    saw_done = true;
+                    break 'chunks;
                 }
 
                 let payload: serde_json::Value =
                     serde_json::from_str(&event.data).map_err(|e| {
                         ProviderError::malformed(format!("failed to parse SSE JSON: {e}"))
                     })?;
+                if payload.get("error").is_some() {
+                    return Err(
+                        ProviderError::invalid("SSE stream returned an error payload").into(),
+                    );
+                }
 
                 // Check for usage at the top level or in choices[0].
                 if let Some(raw_usage) = payload
@@ -543,6 +583,27 @@ impl Model for OpenAiCompatProvider {
                     .and_then(|v| v.as_array())
                     .and_then(|c| c.first())
                 {
+                    if finish_reason.is_some()
+                        && (choice
+                            .get("delta")
+                            .and_then(|d| d.get("content"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty())
+                            || choice
+                                .get("delta")
+                                .and_then(|d| d.get("reasoning_content"))
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|s| !s.is_empty())
+                            || choice
+                                .get("delta")
+                                .and_then(|d| d.get("tool_calls"))
+                                .is_some())
+                    {
+                        return Err(ProviderError::malformed(
+                            "SSE stream mutated completion after finish reason",
+                        )
+                        .into());
+                    }
                     let delta = choice.get("delta").cloned().unwrap_or_default();
 
                     // Text content.
@@ -606,6 +667,20 @@ impl Model for OpenAiCompatProvider {
                     }
                 }
             }
+        }
+
+        if !buffer.is_empty() {
+            return Err(
+                ProviderError::malformed("SSE stream ended with an incomplete event").into(),
+            );
+        }
+        if finish_reason.is_none() {
+            return Err(ProviderError::malformed(if saw_done {
+                "SSE stream ended with [DONE] but no finish reason"
+            } else {
+                "SSE stream ended without a finish reason"
+            })
+            .into());
         }
 
         // Finalize the assembled response.
@@ -724,6 +799,25 @@ mod tests {
         assert_eq!(response.content, "hello world");
         assert_eq!(response.finish_reason, FinishReason::Stop);
         assert!(response.usage.is_unknown());
+    }
+
+    #[test]
+    fn parse_completion_rejects_malformed_tool_shape() {
+        let body = json!({
+            "choices": [{
+                "message": {"tool_calls": [{"function": {"name": "echo", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert!(OpenAiCompatProvider::parse_completion(&body).is_err());
+
+        let wrong_type = json!({
+            "choices": [{
+                "message": {"tool_calls": "not-an-array"},
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(OpenAiCompatProvider::parse_completion(&wrong_type).is_err());
     }
 
     #[test]

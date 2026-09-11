@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 // ───────────────────────────────────────────────────────────────────
 // Mock HTTP server
@@ -53,6 +54,7 @@ struct MockResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    hold_open: Option<Arc<Notify>>,
 }
 
 impl MockResponse {
@@ -61,6 +63,7 @@ impl MockResponse {
             status,
             headers: vec![("content-type".into(), "application/json".into())],
             body: serde_json::to_vec(&body).unwrap(),
+            hold_open: None,
         }
     }
 
@@ -73,11 +76,17 @@ impl MockResponse {
             status,
             headers: vec![("content-type".into(), "text/event-stream".into())],
             body,
+            hold_open: None,
         }
     }
 
     fn error(status: u16, message: &str) -> Self {
         Self::json(status, json!({"error": {"message": message}}))
+    }
+
+    fn hold_open(mut self, release: Arc<Notify>) -> Self {
+        self.hold_open = Some(release);
+        self
     }
 }
 
@@ -186,6 +195,9 @@ async fn handle_request(
     sock.write_all(response_str.as_bytes()).await?;
     sock.write_all(&response.body).await?;
     sock.flush().await?;
+    if let Some(release) = response.hold_open {
+        release.notified().await;
+    }
     Ok(())
 }
 
@@ -1122,6 +1134,89 @@ async fn streaming_fragmented_chunks() {
     let mut sink = CollectingSink::default();
     let response = provider.stream(request, &mut sink).await.unwrap();
     assert_eq!(response.content, "fragmented");
+}
+
+#[tokio::test]
+async fn session_stream_without_finish_does_not_dispatch_tool() {
+    let server = MockServer::start(Box::new(|_, _, _, _| {
+        MockResponse::sse(
+            200,
+            vec![r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"text\":\"x\"}"}}]}}]}"#.into()],
+        )
+    }))
+    .await;
+    let agent =
+        make_agent_loop(Arc::new(make_provider(&server, "test-model"))).with_config(LoopConfig {
+            prefer_streaming: true,
+            ..LoopConfig::default()
+        });
+    let mut session = Session::new("partial");
+    let events = EventCollector::new();
+    let result = agent
+        .run(&mut session, "call echo", &events, &StopToken::new())
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        events.count_of(|e| matches!(e, Event::ToolStarted { .. })),
+        0
+    );
+}
+
+#[tokio::test]
+async fn session_done_without_finish_does_not_dispatch_tool() {
+    let server = MockServer::start(Box::new(|_, _, _, _| {
+        MockResponse::sse(
+            200,
+            vec![r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"text\":\"x\"}"}}]}}]}"#.into(), "[DONE]".into()],
+        )
+    }))
+    .await;
+    let agent =
+        make_agent_loop(Arc::new(make_provider(&server, "test-model"))).with_config(LoopConfig {
+            prefer_streaming: true,
+            ..LoopConfig::default()
+        });
+    let mut session = Session::new("done-no-finish");
+    let events = EventCollector::new();
+    assert!(agent
+        .run(&mut session, "call echo", &events, &StopToken::new())
+        .await
+        .is_err());
+    assert_eq!(
+        events.count_of(|e| matches!(e, Event::ToolStarted { .. })),
+        0
+    );
+}
+
+#[tokio::test]
+async fn session_done_stops_reading_a_kept_open_connection() {
+    let release = Arc::new(Notify::new());
+    let release_for_handler = release.clone();
+    let server = MockServer::start(Box::new(move |_, _, _, _| {
+        MockResponse::sse(
+            200,
+            vec![
+                r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#.into(),
+                "[DONE]".into(),
+            ],
+        )
+        .hold_open(release_for_handler.clone())
+    }))
+    .await;
+    let agent =
+        make_agent_loop(Arc::new(make_provider(&server, "test-model"))).with_config(LoopConfig {
+            prefer_streaming: true,
+            ..LoopConfig::default()
+        });
+    let mut session = Session::new("done-open");
+    let events = EventCollector::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        agent.run(&mut session, "hello", &events, &StopToken::new()),
+    )
+    .await;
+    release.notify_waiters();
+    assert_eq!(result.unwrap().unwrap(), "done");
 }
 
 // ───────────────────────────────────────────────────────────────────

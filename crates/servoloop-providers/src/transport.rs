@@ -142,33 +142,32 @@ pub struct SseEvent {
     pub data: String,
 }
 
-/// Parse SSE events from a buffer, returning remaining unparsed bytes.
+/// Parse SSE events from a UTF-8 byte buffer, returning remaining unparsed bytes.
 ///
 /// SSE events are separated by `\n\n`. Each event may have multiple
 /// `data:` lines that are joined with `\n`. A `data: [DONE]` sentinel
 /// is preserved as-is for the caller to handle.
 ///
 /// This handles fragmentation: partial events remain in the buffer
-/// until the next chunk completes them.
-pub fn parse_sse_events(buffer: &mut String) -> Vec<SseEvent> {
+/// until the next chunk completes them. Invalid UTF-8 in a complete event
+/// is returned as a protocol error rather than replaced.
+pub fn parse_sse_events(buffer: &mut Vec<u8>) -> ProviderResult<Vec<SseEvent>> {
     let mut events = Vec::new();
 
     loop {
         // SSE events are separated by \n\n (or \r\n\r\n per the spec).
-        let sep_pos = buffer.find("\n\n").or_else(|| buffer.find("\r\n\r\n"));
-        let (sep_len, has_sep) = match sep_pos {
-            Some(idx) if buffer.as_bytes().get(idx) == Some(&b'\n') => (2, true),
-            Some(idx) if buffer.as_bytes().get(idx) == Some(&b'\r') => (4, true),
-            Some(_) => (2, true),
-            None => (0, false),
+        let lf = buffer.windows(2).position(|w| w == b"\n\n");
+        let crlf = buffer.windows(4).position(|w| w == b"\r\n\r\n");
+        let (idx, sep_len) = match (lf, crlf) {
+            (Some(lf), Some(crlf)) if crlf < lf => (crlf, 4),
+            (Some(lf), _) => (lf, 2),
+            (None, Some(crlf)) => (crlf, 4),
+            (None, None) => break,
         };
 
-        if !has_sep {
-            break;
-        }
-
-        let idx = sep_pos.unwrap();
-        let raw = buffer[..idx].to_string();
+        let raw = std::str::from_utf8(&buffer[..idx])
+            .map_err(|e| ProviderError::malformed(format!("SSE event was not valid UTF-8: {e}")))?
+            .to_string();
         buffer.drain(..idx + sep_len);
 
         // Collect data: lines. Also handle \r\n line endings within events.
@@ -188,7 +187,7 @@ pub fn parse_sse_events(buffer: &mut String) -> Vec<SseEvent> {
         }
     }
 
-    events
+    Ok(events)
 }
 
 /// Process a chunk of SSE bytes: append to buffer, parse complete events.
@@ -196,12 +195,11 @@ pub fn parse_sse_events(buffer: &mut String) -> Vec<SseEvent> {
 /// Returns the events and `true` if the total stream size has been
 /// exceeded (caller should stop).
 pub fn process_sse_chunk(
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     chunk: &[u8],
     total_bytes: &mut usize,
 ) -> ProviderResult<(Vec<SseEvent>, bool)> {
-    let chunk_str = String::from_utf8_lossy(chunk);
-    buffer.push_str(&chunk_str);
+    buffer.extend_from_slice(chunk);
     *total_bytes += chunk.len();
 
     if *total_bytes > MAX_SSE_TOTAL_BYTES {
@@ -211,7 +209,7 @@ pub fn process_sse_chunk(
         )));
     }
 
-    let events = parse_sse_events(buffer);
+    let events = parse_sse_events(buffer)?;
     Ok((events, false))
 }
 
@@ -266,8 +264,8 @@ mod tests {
 
     #[test]
     fn parse_sse_single_event() {
-        let mut buf = "data: {\"hello\":true}\n\n".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"data: {\"hello\":true}\n\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "{\"hello\":true}");
         assert!(buf.is_empty());
@@ -275,37 +273,37 @@ mod tests {
 
     #[test]
     fn parse_sse_done_sentinel() {
-        let mut buf = "data: [DONE]\n\n".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"data: [DONE]\n\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 1);
         assert!(is_done(&events[0].data));
     }
 
     #[test]
     fn parse_sse_multiline_data() {
-        let mut buf = "data: line1\ndata: line2\n\n".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"data: line1\ndata: line2\n\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "line1\nline2");
     }
 
     #[test]
     fn parse_sse_fragmented() {
-        let mut buf = "data: {\"par".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"data: {\"par".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert!(events.is_empty());
         assert!(!buf.is_empty());
 
-        buf.push_str("tial\":true}\n\n");
-        let events = parse_sse_events(&mut buf);
+        buf.extend_from_slice(b"tial\":true}\n\n");
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "{\"partial\":true}");
     }
 
     #[test]
     fn parse_sse_multiple_events() {
-        let mut buf = "data: first\n\ndata: second\n\n".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"data: first\n\ndata: second\n\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "first");
         assert_eq!(events[1].data, "second");
@@ -313,16 +311,16 @@ mod tests {
 
     #[test]
     fn parse_sse_ignores_non_data_lines() {
-        let mut buf = "event: ping\ndata: hello\n:id: 42\n\n".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"event: ping\ndata: hello\n:id: 42\n\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
     }
 
     #[test]
     fn parse_sse_handles_crlf() {
-        let mut buf = "data: hello\r\n\r\n".to_string();
-        let events = parse_sse_events(&mut buf);
+        let mut buf = b"data: hello\r\n\r\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
     }
@@ -331,25 +329,39 @@ mod tests {
     fn parse_sse_utf8_fragment() {
         // A multi-byte UTF-8 character split across chunks. The boundary
         // falls inside the bytes of 'é' (U+00E9 = 0xC3 0xA9).
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut total = 0usize;
 
-        // First chunk: valid ASCII + first byte of é
-        let chunk1 = "data: caf".as_bytes();
+        // First chunk: valid ASCII + first byte of é.
+        let chunk1 = b"data: caf\xc3";
         let (events, exceeded) = process_sse_chunk(&mut buf, chunk1, &mut total).unwrap();
         assert!(events.is_empty());
         assert!(!exceeded);
 
-        // Second chunk: second byte of é + rest, terminated
-        let chunk2 = "é world\n\n".as_bytes();
+        // Second chunk: second byte of é + rest, terminated.
+        let chunk2 = b"\xa9 world\n\n";
         let (events, _) = process_sse_chunk(&mut buf, chunk2, &mut total).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "café world");
     }
 
     #[test]
+    fn parse_sse_uses_earliest_mixed_separator() {
+        let mut buf = b"data: first\r\n\r\ndata: second\n\n".to_vec();
+        let events = parse_sse_events(&mut buf).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn process_sse_chunk_enforces_limit() {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut total = MAX_SSE_TOTAL_BYTES;
         let big_chunk = vec![b'x'; 100];
         let result = process_sse_chunk(&mut buf, &big_chunk, &mut total);
