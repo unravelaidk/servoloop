@@ -150,10 +150,29 @@ ServoLoop uses the following constraints by default:
 Use the standard Rust checks before submitting a change:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all -- --check
+cargo build --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo doc --workspace --no-deps --locked
 ```
+
+The CI workflow runs these checks on stable Rust for Linux, Windows, and
+macOS. It also runs the simulated-arm example as an offline deterministic
+smoke test. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for provider setup,
+Models.dev discovery, compatibility evidence, and hardware limitations.
+
+The OpenAI-compatible provider supports OpenAI, NVIDIA, OpenRouter, local
+Ollama, and custom endpoints. Provider credentials use the corresponding
+environment variables, such as `OPENAI_API_KEY`; the live demo requires a
+real key and is not run in CI. Models.dev capability metadata is discovery
+input, not a guarantee that a model invocation succeeds.
+
+Isaac Sim verification is not included in this repository's default CI. The
+Isaac version, robot/scene, NVIDIA runtime, and deployment topology remain
+pending an explicit adapter decision. No Isaac CLI is installed here. The
+simulated example is not hardware validation, and software stop is not a
+safety-rated physical safeguard.
 
 ## License
 
