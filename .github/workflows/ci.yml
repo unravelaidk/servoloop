@@ -76,3 +76,11 @@ jobs:
           grep -F '"type":"run_completed"' example-output.jsonl
           grep -F '"session_id":"simulated-arm-demo"' example-output.jsonl
           grep -F 'The simulated shoulder moved to 0.2 radians.' example-output.jsonl
+
+  python-bridge:
+    name: Isaac bridge protocol tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s adapters/isaac-sim -p 'test_bridge.py' -v

@@ -936,6 +936,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "servoloop-isaac"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "servoloop-core",
+ "servoloop-robot",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "servoloop-isaac-example"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "servoloop-core",
+ "servoloop-isaac",
+ "servoloop-robot",
+ "tokio",
+]
+
+[[package]]
 name = "servoloop-openai-compatible-demo"
 version = "0.1.0"
 dependencies = [

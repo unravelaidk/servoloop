@@ -1,0 +1,13 @@
+[package]
+name = "servoloop-isaac-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+servoloop-core = { path = "../../crates/servoloop-core" }
+servoloop-isaac = { path = "../../crates/servoloop-isaac" }
+servoloop-robot = { path = "../../crates/servoloop-robot" }
+serde_json.workspace = true
+tokio.workspace = true
