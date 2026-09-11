@@ -69,12 +69,18 @@ already in flight and is therefore recorded as an unknown outcome. Reconcile
 the physical state before resuming, and never automatically replay uncertain
 motion.
 
-## Release status
+## CLI packaging and installation
 
-Release publication and binary packaging are blocked until the CLI/store
-deliverable defines the binary name, flags, exit codes, fixtures, supported
-targets, archive layout, and checksum procedure. Do not add credentials,
-signing keys, or a publish workflow before those requirements are verified.
+The manual packaging workflow in `.github/workflows/package.yml` builds and
+smoke-tests native archives for Linux x86_64 (glibc 2.39), Windows x86_64, and
+macOS arm64 and x86_64. It uploads artifacts only; it does not publish
+releases, push tags, or require secrets. Keep checksum verification and target
+claims aligned with the workflow. Checksums provide integrity, not
+authenticity, and macOS binaries remain unsigned.
+
+See [`docs/install.md`](docs/install.md) for archive installation. ServoLoop
+is not published on crates.io; a source install uses
+`cargo install --path apps/servoloop-cli --locked` from a clone.
 
 ## Pull requests
 

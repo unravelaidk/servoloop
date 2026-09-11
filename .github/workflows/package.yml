@@ -1,0 +1,147 @@
+name: Package CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Archive version label (for example, 0.1.0)
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - '.github/workflows/package.yml'
+      - 'scripts/**'
+      - 'packages/**'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
+      - 'docs/install.md'
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64-glibc-2.39
+            npm-target: linux-x64-glibc-2.39
+          - os: windows-latest
+            target: windows-x86_64
+            npm-target: win32-x64
+          - os: macos-14
+            target: macos-arm64
+            npm-target: darwin-arm64
+          - os: macos-15-intel
+            target: macos-x86_64
+            npm-target: darwin-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install workspace tooling
+        run: pnpm install --frozen-lockfile
+      - name: Build release binary
+        run: cargo build --release --locked -p servoloop-cli
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/release/servoloop"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/servoloop.exe"
+          "$bin" --version
+          "$bin" --help
+          "$bin" run --demo --store "$RUNNER_TEMP/servoloop-store" >/dev/null
+      - name: Create archive and checksums
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version || '0.1.0' }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/release/servoloop"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/servoloop.exe"
+          bash scripts/package-binary.sh "$bin" "$VERSION" "$TARGET"
+      - name: Pack and smoke test npm packages
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version || '0.1.0' }}
+          TARGET: ${{ matrix.npm-target }}
+        run: |
+          set -euo pipefail
+          bin="target/release/servoloop"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/servoloop.exe"
+          node scripts/test-npm-install.mjs "$bin" "$VERSION" "$TARGET"
+      - name: Verify archive checksum and extracted binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print | head -n1)
+          if command -v sha256sum >/dev/null; then
+            (cd "$(dirname "$archive")" && sha256sum -c SHA256SUMS)
+          else
+            expected=$(awk -v n="$(basename "$archive")" '$2 == n { print $1; exit }' dist/SHA256SUMS)
+            actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+            [[ "$actual" == "$expected" ]]
+          fi
+          rm -rf extracted && mkdir extracted
+          case "$archive" in
+            *.tar.gz) tar -xzf "$archive" -C extracted; bin=extracted/bin/servoloop ;;
+            *.zip) python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$archive" extracted; bin=extracted/bin/servoloop.exe ;;
+          esac
+          "$bin" --version
+          "$bin" run --demo --store "$RUNNER_TEMP/servoloop-extracted-store" >/dev/null
+      - name: Test installer on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find dist -type f -name '*.tar.gz' -print | head -n1)
+          bash scripts/install.sh --archive "$archive" --checksum-file dist/SHA256SUMS \
+            --prefix "$RUNNER_TEMP/servoloop install/bin"
+          "$RUNNER_TEMP/servoloop install/bin/servoloop" --version
+      - name: Test PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem dist -Filter *.zip | Select-Object -First 1
+          $prefix = Join-Path $env:RUNNER_TEMP 'servoloop install\bin'
+          & ./scripts/install.ps1 -Archive $archive.FullName -ChecksumFile (Join-Path (Get-Location) 'dist\SHA256SUMS') -Prefix $prefix
+          $installed = Join-Path $prefix 'servoloop.exe'
+          & $installed --version
+          $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'bad-SHA256SUMS') -Value ('0' * 64 + '  ' + $archive.Name)
+          try {
+            & ./scripts/install.ps1 -Archive $archive.FullName -ChecksumFile (Join-Path $env:RUNNER_TEMP 'bad-SHA256SUMS') -Prefix $prefix
+            throw 'bad checksum unexpectedly succeeded'
+          } catch {
+            if ($_.Exception.Message -eq 'bad checksum unexpectedly succeeded') { throw }
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash -ne $before) { throw 'failed install changed existing binary' }
+      - name: Upload archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: servoloop-${{ matrix.target }}
+          path: |
+            dist/*
+            dist/npm/*
+          if-no-files-found: error

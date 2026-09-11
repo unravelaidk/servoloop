@@ -1,0 +1,21 @@
+[package]
+name = "servoloop-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "servoloop"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+servoloop-core = { path = "../../crates/servoloop-core" }
+servoloop-providers = { path = "../../crates/servoloop-providers" }
+servoloop-store = { path = "../../crates/servoloop-store" }
+servoloop-robot = { path = "../../crates/servoloop-robot" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
