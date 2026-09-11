@@ -145,6 +145,22 @@ ServoLoop uses the following constraints by default:
    The loop halts until the caller replaces each unknown with a resolved
    result.
 
+## Install the CLI
+
+The CLI packaging workflow uploads native, checksum accompanied artifacts for
+Linux x86_64 (glibc 2.39), Windows x86_64, and macOS arm64 and x86_64. It does
+not publish releases yet. See [`docs/install.md`](docs/install.md) for manual
+artifact installation and verification.
+
+From a clone, you can also install the current CLI into Cargo's user bin
+directory:
+
+```bash
+cargo install --path apps/servoloop-cli --locked
+```
+
+This source install requires a clone; ServoLoop is not published on crates.io.
+
 ## Development
 
 Use the standard Rust checks before submitting a change:
