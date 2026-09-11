@@ -18,16 +18,20 @@ pub const DEFAULT_MODELS_DEV_URL: &str = "https://models.dev/api.json";
 /// Environment variable for overriding the catalog URL.
 pub const MODELS_DEV_URL_ENV: &str = "SERVOLOOP_MODELS_DEV_URL";
 
+/// Resolve the effective catalog URL once for a discovery operation.
+pub fn resolve_catalog_url(url: Option<&str>) -> String {
+    url.map(str::to_owned)
+        .or_else(|| std::env::var(MODELS_DEV_URL_ENV).ok())
+        .unwrap_or_else(|| DEFAULT_MODELS_DEV_URL.to_string())
+}
+
 /// Fetch the Models.dev catalog.
 ///
 /// Uses the default URL or an explicit override via
 /// [`MODELS_DEV_URL_ENV`](MODELS_DEV_URL_ENV) or the `url` parameter.
 /// The `url` parameter takes precedence over the env variable.
 pub async fn fetch_catalog(url: Option<&str>) -> ProviderResult<Vec<CatalogProvider>> {
-    let endpoint = url
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var(MODELS_DEV_URL_ENV).ok())
-        .unwrap_or_else(|| DEFAULT_MODELS_DEV_URL.to_string());
+    let endpoint = resolve_catalog_url(url);
 
     let client = build_client()?;
     let response = client

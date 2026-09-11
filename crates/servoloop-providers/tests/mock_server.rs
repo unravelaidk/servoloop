@@ -1442,6 +1442,35 @@ async fn discovery_cache_isolates_by_endpoint() {
 }
 
 #[tokio::test]
+async fn discovery_cache_isolates_provider_metadata_on_same_endpoint() {
+    let endpoint = MockServer::start(Box::new(|_, path, _, _| {
+        if path.ends_with("/v1/models") {
+            MockResponse::json(200, json!({"data": []}))
+        } else {
+            MockResponse::error(404, "not found")
+        }
+    }))
+    .await;
+    let catalog = MockServer::start(Box::new(|_, _, _, _| MockResponse::json(200, json!({
+        "provider-a": {"name": "A", "models": {"shared": {"name": "A shared", "tool_call": true}}},
+        "provider-b": {"name": "B", "models": {"shared": {"name": "B shared", "tool_call": false}}}
+    })))).await;
+    let options = DiscoveryOptions {
+        models_dev_url_override: Some(format!("http://{}/catalog.json", catalog.addr)),
+        ..Default::default()
+    };
+    let spec_a = ProviderSpec::custom("provider-a", "A", endpoint.base_url(), None::<Secret>);
+    let spec_b = ProviderSpec::custom("provider-b", "B", endpoint.base_url(), None::<Secret>);
+    let discovery = Discovery::new();
+    let models_a = discovery.discover(&spec_a, &options).await.unwrap();
+    let models_b = discovery.discover(&spec_b, &options).await.unwrap();
+    assert_eq!(models_a[0].name, "A shared");
+    assert_eq!(models_a[0].tool_support, ToolSupport::Yes);
+    assert_eq!(models_b[0].name, "B shared");
+    assert_eq!(models_b[0].tool_support, ToolSupport::No);
+}
+
+#[tokio::test]
 async fn discovery_explicit_model_ids_offline() {
     // Unreachable endpoint — only explicit IDs should be returned.
     let spec = ProviderSpec::custom(
@@ -1466,6 +1495,134 @@ async fn discovery_explicit_model_ids_offline() {
     assert!(models
         .iter()
         .all(|m| m.tool_support == ToolSupport::Unknown));
+}
+
+#[tokio::test]
+async fn discovery_cache_includes_explicit_ids_and_catalog_url() {
+    let endpoint = MockServer::start(Box::new(|_, path, _, _| {
+        if path.ends_with("/v1/models") {
+            MockResponse::json(200, json!({"data": []}))
+        } else {
+            MockResponse::error(404, "not found")
+        }
+    }))
+    .await;
+    let catalog_a = MockServer::start(Box::new(|_, _, _, _| {
+        MockResponse::json(
+            200,
+            json!({"provider": {"name": "P", "models": {
+                "catalog-a": {"name": "A"}
+            }}}),
+        )
+    }))
+    .await;
+    let catalog_b = MockServer::start(Box::new(|_, _, _, _| {
+        MockResponse::json(
+            200,
+            json!({"provider": {"name": "P", "models": {
+                "catalog-b": {"name": "B"}
+            }}}),
+        )
+    }))
+    .await;
+    let spec = ProviderSpec::custom("provider", "P", endpoint.base_url(), None::<Secret>);
+    let discovery = Discovery::new();
+
+    let first = DiscoveryOptions {
+        include_models_dev: true,
+        explicit_model_ids: vec!["first".into()],
+        models_dev_url_override: Some(format!("http://{}/api.json", catalog_a.addr)),
+        ..Default::default()
+    };
+    let second = DiscoveryOptions {
+        include_models_dev: true,
+        explicit_model_ids: vec!["second".into()],
+        models_dev_url_override: Some(format!("http://{}/api.json", catalog_b.addr)),
+        ..Default::default()
+    };
+    let a = discovery.discover(&spec, &first).await.unwrap();
+    let b = discovery.discover(&spec, &second).await.unwrap();
+    assert!(a
+        .iter()
+        .any(|m| m.model_id == "first" && m.model_id != "second"));
+    assert!(a.iter().any(|m| m.model_id == "catalog-a"));
+    assert!(b
+        .iter()
+        .any(|m| m.model_id == "second" && m.model_id != "first"));
+    assert!(b.iter().any(|m| m.model_id == "catalog-b"));
+}
+
+#[tokio::test]
+async fn discovery_ollama_main_api_uses_native_tags() {
+    let server = MockServer::start(Box::new(|_, path, _, headers| {
+        assert_eq!(path, "/api/tags");
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer ollama-key")
+        );
+        MockResponse::json(200, json!({"models": [{"name": "llama3:8b"}]}))
+    }))
+    .await;
+    let spec = ProviderSpec::ollama()
+        .with_base_url(format!("http://{}/v1", server.addr))
+        .with_key(Secret::new("ollama-key"));
+    let options = DiscoveryOptions {
+        include_models_dev: false,
+        ..Default::default()
+    };
+    let models = Discovery::new().discover(&spec, &options).await.unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|m| m.model_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["llama3:8b"]
+    );
+}
+
+#[tokio::test]
+async fn discovery_total_failure_is_typed_and_not_cached() {
+    let spec = ProviderSpec::custom(
+        "offline",
+        "Offline",
+        "http://127.0.0.1:1/v1",
+        None::<Secret>,
+    );
+    let options = DiscoveryOptions {
+        models_dev_url_override: Some("http://127.0.0.1:1/catalog.json".into()),
+        ..Default::default()
+    };
+    let err = Discovery::new()
+        .discover(&spec, &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        servoloop_providers::ProviderError::DiscoveryFailed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn discovery_rejects_empty_explicit_model_id() {
+    let spec = ProviderSpec::custom(
+        "offline",
+        "Offline",
+        "http://127.0.0.1:1/v1",
+        None::<Secret>,
+    );
+    let options = DiscoveryOptions {
+        include_models_dev: false,
+        explicit_model_ids: vec!["  ".into()],
+        ..Default::default()
+    };
+    let err = Discovery::new()
+        .discover(&spec, &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        servoloop_providers::ProviderError::Invalid { .. }
+    ));
 }
 
 #[tokio::test]
