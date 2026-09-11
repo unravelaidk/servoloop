@@ -3,6 +3,13 @@
 `servoloop` emits NDJSON events on standard output for both `run --demo` and
 live `run --prompt TEXT`, and `resume SESSION --prompt TEXT` executions;
 diagnostics always go to standard error.
+
+The CLI keeps composition in `src/main.rs` and groups responsibilities by
+boundary: typed argument compatibility parsing is in `args.rs`, configuration
+and private directory resolution in `config.rs`, redacted output in
+`output.rs`, execution and lifecycle ownership in `execution.rs`, and the
+simulator and durable tool decorator in `simulation.rs` and `journal_tool.rs`.
+Command-specific discovery and session operations live in `commands.rs`.
 Live runs use the existing OpenAI-compatible provider and the simulated driver
 in this slice. Ctrl-C cancels the model loop, awaits a bounded emergency-stop
 cleanup, and never reports an interrupted action as successful. This driver

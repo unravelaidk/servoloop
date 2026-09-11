@@ -202,6 +202,21 @@ fn demo_runs_real_loop_and_writes_journal() {
 }
 
 #[test]
+fn demo_respects_turn_limit_through_shared_runner() {
+    let root = std::env::temp_dir().join(format!("servoloop-demo-limit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let output = bin()
+        .args(["run", "--demo", "--max-turns", "1", "--store"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(r#""outcome":"failed""#));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn resume_sends_saved_history_and_only_dispatches_the_new_call() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
