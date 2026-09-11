@@ -14,6 +14,19 @@ pub enum Event {
         turn: usize,
         attempt: u32,
     },
+    ModelRetry {
+        turn: usize,
+        attempt: u32,
+        error: String,
+        retryable: bool,
+    },
+    ModelStreamStarted {
+        turn: usize,
+    },
+    ModelStreamDelta {
+        turn: usize,
+        kind: String,
+    },
     ToolStarted {
         turn: usize,
         call_id: String,
@@ -25,6 +38,9 @@ pub enum Event {
         tool: String,
         is_error: bool,
         metadata: Value,
+    },
+    Reconciled {
+        unknown: usize,
     },
     RunCompleted {
         session_id: String,
