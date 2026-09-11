@@ -37,6 +37,8 @@ pub enum ProviderError {
     ModelDeprecated { model_id: String },
     /// The provider returned an unparseable or malformed response.
     MalformedResponse { redacted_detail: String },
+    /// Neither the provider endpoint nor the catalog could provide a result.
+    DiscoveryFailed { redacted_detail: String },
     /// A tool result references an unresolved `ToolUnknown` call.
     UnresolvedToolUnknown { call_id: String },
 }
@@ -80,6 +82,9 @@ impl std::fmt::Display for ProviderError {
             }
             ProviderError::MalformedResponse { redacted_detail } => {
                 write!(f, "malformed provider response: {redacted_detail}")
+            }
+            ProviderError::DiscoveryFailed { redacted_detail } => {
+                write!(f, "model discovery failed: {redacted_detail}")
             }
             ProviderError::UnresolvedToolUnknown { call_id } => {
                 write!(
@@ -134,6 +139,12 @@ impl ProviderError {
         }
     }
 
+    pub fn discovery_failed(detail: impl Into<String>) -> Self {
+        ProviderError::DiscoveryFailed {
+            redacted_detail: redact(detail),
+        }
+    }
+
     /// Convert this provider error into the core [`Error`] with proper
     /// retryability classification.
     pub fn into_core_error(self) -> Error {
@@ -149,6 +160,9 @@ impl ProviderError {
                 self.to_string(),
                 servoloop_core::Retryability::Permanent,
             )),
+            ProviderError::DiscoveryFailed { .. } => {
+                Error::ModelTyped(ModelError::transient(self.to_string()))
+            }
             ProviderError::Transient {
                 retry_after: Some(d),
                 ..

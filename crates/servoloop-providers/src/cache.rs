@@ -160,30 +160,50 @@ impl<K, V> std::fmt::Debug for TtlCache<K, V> {
 /// protocol, and relevant discovery options.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct DiscoveryCacheKey {
+    pub provider_id: String,
     pub endpoint: String,
     pub account_identity: String,
     pub protocol: String,
     pub include_models_dev: bool,
     pub filter_for_tools: bool,
+    pub explicit_model_ids: Vec<String>,
+    pub models_dev_url: String,
+    pub timeout: Duration,
 }
 
 impl DiscoveryCacheKey {
     /// Build a cache key from the relevant parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        provider_id: &str,
         endpoint: &str,
         account_identity: &str,
         protocol: &str,
         include_models_dev: bool,
         filter_for_tools: bool,
+        explicit_model_ids: Vec<String>,
+        models_dev_url: &str,
+        timeout: Duration,
     ) -> Self {
         Self {
+            provider_id: provider_id.to_string(),
             endpoint: endpoint.to_string(),
             account_identity: account_identity.to_string(),
             protocol: protocol.to_string(),
             include_models_dev,
             filter_for_tools,
+            explicit_model_ids,
+            models_dev_url: digest(models_dev_url),
+            timeout,
         }
     }
+}
+
+fn digest(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
@@ -279,11 +299,15 @@ mod tests {
     #[test]
     fn discovery_cache_key_has_no_secrets() {
         let key = DiscoveryCacheKey::new(
+            "openai",
             "https://api.openai.com/v1",
             "openai:abcdef0123456789",
             "openai-chat-completions",
             true,
             false,
+            Vec::new(),
+            "https://models.dev/api.json",
+            Duration::from_secs(10),
         );
         let debug = format!("{:?}", key);
         assert!(debug.contains("api.openai.com"));
