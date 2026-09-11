@@ -10,19 +10,20 @@
 //! race. Unix directory syncing is supported. Snapshot replacement uses the
 //! `tempfile` crate's platform-specific atomic rename operation.
 
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{BufReader, Read, Write},
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod filesystem;
+mod journal;
+mod snapshot;
+
+pub use journal::JournalRecord;
+
 pub const SCHEMA_VERSION: u32 = 1;
-const MAX_RECORD: usize = 64 * 1024;
-const MAX_RECORDS: usize = 100_000;
-const MAX_JOURNAL: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -34,7 +35,7 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("store data: {0}")]
     Data(#[from] serde_json::Error),
-    #[error("record exceeds {MAX_RECORD} bytes")]
+    #[error("record exceeds 65536 bytes")]
     TooLarge,
     #[error("journal lock timed out")]
     LockTimeout,
@@ -46,21 +47,6 @@ pub enum StoreError {
     Unresolved,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
-
-/// Kept string-shaped for compatibility with the CLI and older journal files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JournalRecord {
-    pub version: u32,
-    pub sequence: u64,
-    pub session_id: String,
-    pub intent_id: String,
-    pub kind: String,
-    pub arguments: serde_json::Value,
-    /// `Some("verified")` is success; `None` on a result is an explicit
-    /// unknown outcome and remains unresolved forever until `resolve_unknown`.
-    pub outcome: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -102,15 +88,6 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Snapshot {
-    version: u32,
-    /// Number of journal records represented by this terminal snapshot.
-    journal_sequence: u64,
-    session: servoloop_core::Session,
 }
 
 impl Store {
@@ -161,7 +138,7 @@ impl Store {
                 fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
             }
         }
-        sync_directory(&dir)
+        filesystem::sync_directory(&dir)
     }
     fn journal_path(&self, id: &str) -> Result<PathBuf> {
         self.create_session(id)?;
@@ -190,116 +167,36 @@ impl Store {
         let guard = self.acquire_session(&record.session_id)?;
         guard.append(record)
     }
-    fn append_locked(&self, mut record: JournalRecord, trusted_resolution: bool) -> Result<()> {
-        if record.version != SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedVersion(record.version));
-        }
-        Self::safe_id(&record.intent_id)?;
+    fn append_locked(&self, record: JournalRecord, trusted_resolution: bool) -> Result<()> {
         let path = self.journal_path(&record.session_id)?;
-        let lock_path = path.with_extension("lock");
-        let _lock = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(_) => FileLock(lock_path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(StoreError::Busy)
-            }
-            Err(e) => return Err(e.into()),
-        };
-        reject_symlink(&path)?;
         let existing = self.records(&record.session_id)?;
-        record.sequence = existing.len() as u64 + 1;
-        let mut candidate = existing;
-        candidate.push(record.clone());
-        validate_records_with_resolution(&record.session_id, &candidate, trusted_resolution)?;
-        let bytes = serde_json::to_vec(&record)?;
-        if bytes.len() > MAX_RECORD {
-            return Err(StoreError::TooLarge);
-        }
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        sync_directory(&self.session_dir(&record.session_id)?)
+        journal::append(
+            &path,
+            &self.session_dir(&record.session_id)?,
+            record,
+            &existing,
+            trusted_resolution,
+        )
     }
     pub fn records(&self, id: &str) -> Result<Vec<JournalRecord>> {
         let path = self.journal_path(id)?;
-        reject_symlink(&path)?;
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let size = fs::metadata(&path)?.len();
-        if size > MAX_JOURNAL {
-            return Err(StoreError::TooLarge);
-        }
-        let mut out = Vec::new();
-        let mut reader = BufReader::new(File::open(path)?);
-        let mut raw = Vec::new();
-        loop {
-            raw.clear();
-            // Cap the reader before it can grow `raw`; a hostile unterminated
-            // line must not cause an allocation proportional to the journal.
-            let mut count = 0;
-            for _ in 0..=MAX_RECORD {
-                let mut byte = [0_u8; 1];
-                let read = reader.read(&mut byte)?;
-                if read == 0 {
-                    break;
-                }
-                raw.push(byte[0]);
-                count += 1;
-                if byte[0] == b'\n' {
-                    break;
-                }
-            }
-            if count == 0 {
-                break;
-            }
-            if raw.len() > MAX_RECORD + 1 || raw.last() != Some(&b'\n') {
-                return Err(StoreError::InvalidJournal(
-                    "record is not newline terminated or is too large".into(),
-                ));
-            }
-            raw.pop();
-            if raw.last() == Some(&b'\r') {
-                raw.pop();
-            }
-            out.push(serde_json::from_slice(&raw)?);
-            if out.len() > MAX_RECORDS {
-                return Err(StoreError::TooLarge);
-            }
-        }
-        // A verified record after an unknown is valid only when it was
-        // written through the trusted resolution API. The journal format is
-        // intentionally compatible with older callers, so the provenance is
-        // enforced at append time and the reader accepts that final state.
-        validate_records_with_resolution(id, &out, true)?;
-        Ok(out)
+        journal::read(&path, id)
     }
     pub fn sessions(&self) -> Result<Vec<String>> {
-        list_dirs(&self.root)
+        filesystem::list_dirs(&self.root)
     }
     pub fn delete(&self, id: &str) -> Result<()> {
         let _guard = self.acquire_session(id)?;
         let dir = self.session_dir(id)?;
         if dir.exists() {
-            reject_symlink(&dir)?;
+            filesystem::reject_symlink(&dir)?;
             fs::remove_dir_all(dir)?;
         }
         Ok(())
     }
     pub fn unresolved(&self, id: &str) -> Result<Vec<JournalRecord>> {
         let records = self.records(id)?;
-        unresolved_records(&records)
+        journal::unresolved(&records)
     }
     /// Trusted operator-only resolution. Model/tool dispatch code must not be
     /// given this capability. It is the sole path from unknown to verified.
@@ -310,7 +207,7 @@ impl Store {
             .iter()
             .find(|r| r.intent_id == intent_id && r.kind == "intent");
         if intent.is_none()
-            || !unresolved_records(&records)?
+            || !journal::unresolved(&records)?
                 .iter()
                 .any(|r| r.intent_id == intent_id)
         {
@@ -336,34 +233,14 @@ impl Store {
 
     fn save_snapshot_locked(&self, session: &servoloop_core::Session) -> Result<()> {
         Self::safe_id(&session.id)?;
-        if !self.unresolved(&session.id)?.is_empty()
-            || session
-                .messages
-                .iter()
-                .any(|m| matches!(m, servoloop_core::Message::ToolUnknown { .. }))
-        {
-            return Err(StoreError::Unresolved);
-        }
         let dir = self.session_dir(&session.id)?;
-        let journal_sequence = self.records(&session.id)?.len() as u64;
-        let data = serde_json::to_vec(&Snapshot {
-            version: 2,
-            journal_sequence,
-            session: session.clone(),
-        })?;
-        if data.len() as u64 > MAX_JOURNAL {
-            return Err(StoreError::TooLarge);
-        }
-        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
-        tmp.write_all(&data)?;
-        tmp.as_file().sync_all()?;
-        let target = dir.join("snapshot.json");
-        reject_symlink(&target)?;
-        // `persist` uses rename on Unix and MoveFileEx(REPLACE_EXISTING) on
-        // Windows. Unlike the old remove-then-rename approach, a failed
-        // replacement leaves the previous snapshot in place.
-        tmp.persist(&target).map_err(|e| StoreError::Io(e.into()))?;
-        sync_directory(&dir)
+        let records = self.records(&session.id)?;
+        snapshot::write(
+            &dir,
+            session,
+            records.len() as u64,
+            !journal::unresolved(&records)?.is_empty(),
+        )
     }
     pub fn load_snapshot(&self, id: &str) -> Result<servoloop_core::Session> {
         Self::safe_id(id)?;
@@ -389,39 +266,13 @@ impl Store {
     }
 
     fn load_snapshot_file(&self, id: &str, path: PathBuf) -> Result<servoloop_core::Session> {
-        reject_symlink(&path)?;
-        let mut data = Vec::new();
-        File::open(path)?
-            .take(MAX_JOURNAL + 1)
-            .read_to_end(&mut data)?;
-        if data.len() as u64 > MAX_JOURNAL {
-            return Err(StoreError::TooLarge);
-        }
-        let snapshot: Snapshot = serde_json::from_slice(&data)?;
-        if snapshot.version != 2 {
-            return Err(StoreError::UnsupportedVersion(snapshot.version));
-        }
-        if snapshot.session.id != id {
-            return Err(StoreError::InvalidJournal(
-                "snapshot session mismatch".into(),
-            ));
-        }
-        if !self.unresolved(id)?.is_empty()
-            || snapshot
-                .session
-                .messages
-                .iter()
-                .any(|m| matches!(m, servoloop_core::Message::ToolUnknown { .. }))
-        {
-            return Err(StoreError::Unresolved);
-        }
+        let snapshot = snapshot::read(&path, id)?;
         let records = self.records(id)?;
-        if snapshot.journal_sequence != records.len() as u64 {
-            return Err(StoreError::InvalidJournal(
-                "snapshot journal watermark does not match journal".into(),
-            ));
-        }
-        Ok(snapshot.session)
+        snapshot::validate(
+            snapshot,
+            records.len() as u64,
+            !journal::unresolved(&records)?.is_empty(),
+        )
     }
     pub fn snapshot_sessions(&self) -> Result<Vec<String>> {
         self.sessions().map(|v| {
@@ -432,12 +283,6 @@ impl Store {
     }
 }
 
-struct FileLock(PathBuf);
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 pub fn new_id(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -453,102 +298,6 @@ pub fn new_id(prefix: &str) -> String {
     )
 }
 
-fn unresolved_records(records: &[JournalRecord]) -> Result<Vec<JournalRecord>> {
-    let mut out = Vec::new();
-    for r in records {
-        if r.kind == "intent" {
-            out.push(r.clone());
-        } else if r.kind == "result" && r.outcome.is_none() { /* remains in out */
-        }
-    }
-    for r in records
-        .iter()
-        .filter(|r| r.kind == "result" && r.outcome.is_some())
-    {
-        out.retain(|i| i.intent_id != r.intent_id);
-    }
-    Ok(out)
-}
-fn validate_records_with_resolution(
-    session: &str,
-    records: &[JournalRecord],
-    trusted_resolution: bool,
-) -> Result<()> {
-    let mut history = std::collections::BTreeSet::new();
-    let mut states = std::collections::BTreeMap::<String, u8>::new();
-    for (expected, r) in (1_u64..).zip(records) {
-        if r.version != SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedVersion(r.version));
-        }
-        if r.session_id != session || r.sequence != expected {
-            return Err(StoreError::InvalidJournal(
-                "session or sequence mismatch".into(),
-            ));
-        }
-        if !history.insert(r.intent_id.clone()) && r.kind == "intent" {
-            return Err(StoreError::InvalidJournal(
-                "duplicate intent id in history".into(),
-            ));
-        }
-        match r.kind.as_str() {
-            "intent" if r.outcome.is_none() && !states.contains_key(&r.intent_id) => {
-                states.insert(r.intent_id.clone(), 1);
-            }
-            "result"
-                if states.get(&r.intent_id) == Some(&1)
-                    && (r.outcome.is_none() || r.outcome.as_deref() == Some("verified")) =>
-            {
-                states.insert(r.intent_id.clone(), if r.outcome.is_some() { 2 } else { 3 });
-            }
-            "result"
-                if trusted_resolution
-                    && states.get(&r.intent_id) == Some(&3)
-                    && r.outcome.as_deref() == Some("verified") =>
-            {
-                states.insert(r.intent_id.clone(), 2);
-            }
-            _ => {
-                return Err(StoreError::InvalidJournal(
-                    "invalid state transition".into(),
-                ))
-            }
-        }
-    }
-    Ok(())
-}
-fn reject_symlink(path: &Path) -> Result<()> {
-    if path.exists() && fs::symlink_metadata(path)?.file_type().is_symlink() {
-        Err(StoreError::InvalidId)
-    } else {
-        Ok(())
-    }
-}
-fn list_dirs(root: &Path) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for e in fs::read_dir(root)? {
-        let e = e?;
-        if e.file_type()?.is_dir() && !e.file_type()?.is_symlink() {
-            if let Some(s) = e.file_name().to_str() {
-                if Store::safe_id(s).is_ok() {
-                    out.push(s.into());
-                }
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,7 +376,11 @@ mod tests {
         s.create_session("a").unwrap();
         fs::write(p.join("a/journal.ndjson"), b"{\"version\":1").unwrap();
         assert!(s.records("a").is_err());
-        fs::write(p.join("a/journal.ndjson"), vec![b'x'; MAX_RECORD + 2]).unwrap();
+        fs::write(
+            p.join("a/journal.ndjson"),
+            vec![b'x'; journal::MAX_RECORD + 2],
+        )
+        .unwrap();
         assert!(s.records("a").is_err());
         let _ = fs::remove_dir_all(p);
     }
