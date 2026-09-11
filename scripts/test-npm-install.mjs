@@ -32,7 +32,8 @@ try {
   const launcherTarball = join(dist, `servoloop-${version}.tgz`);
   const nativeTarball = join(dist, `${nativeName}-${version}.tgz`);
   const unpack = join(tmp, 'unpack'); await mkdir(unpack);
-  await run('tar', ['-xzf', launcherTarball, '-C', unpack]);
+  const tar = process.platform === 'win32' ? join(process.env.SystemRoot, 'System32', 'tar.exe') : 'tar';
+  await run(tar, ['-xzf', launcherTarball, '-C', unpack]);
   const fixture = join(unpack, 'package');
   const launcher = JSON.parse(await readFile(join(fixture, 'package.json'), 'utf8'));
   if (Object.values(launcher.optionalDependencies).some(value => value !== version)) {
