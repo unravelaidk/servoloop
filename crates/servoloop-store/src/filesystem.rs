@@ -5,10 +5,7 @@
 //! lock only serializes a single durable journal transition.
 
 use crate::{Result, Store, StoreError};
-use std::{
-    fs::{self, File},
-    path::Path,
-};
+use std::{fs, path::Path};
 
 pub(crate) struct FileLock(pub(crate) std::path::PathBuf);
 
@@ -44,7 +41,7 @@ pub(crate) fn list_dirs(root: &Path) -> Result<Vec<String>> {
 
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
-    File::open(path)?.sync_all()?;
+    fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
