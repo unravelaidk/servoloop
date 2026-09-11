@@ -255,9 +255,8 @@ pub fn new_id(prefix: &str) -> String {
 }
 
 fn validate_records(session: &str, records: &[JournalRecord]) -> Result<()> {
-    let mut expected = 1_u64;
     let mut pending = std::collections::BTreeSet::new();
-    for record in records {
+    for (expected, record) in (1_u64..).zip(records.iter()) {
         if record.version != SCHEMA_VERSION {
             return Err(StoreError::UnsupportedVersion(record.version));
         }
@@ -267,7 +266,6 @@ fn validate_records(session: &str, records: &[JournalRecord]) -> Result<()> {
         if record.sequence != expected {
             return Err(StoreError::InvalidJournal("nonmonotonic sequence".into()));
         }
-        expected += 1;
         match record.kind.as_str() {
             "intent" => {
                 if record.outcome.is_some() || !pending.insert(record.intent_id.clone()) {
