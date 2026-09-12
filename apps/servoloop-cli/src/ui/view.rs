@@ -254,7 +254,7 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let [intro, menu, button, note] = Layout::vertical([
         Constraint::Length(if area.height >= 17 { 6 } else { 5 }),
         Constraint::Length(7),
-        Constraint::Length(if area.height >= 20 { 3 } else { 2 }),
+        Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
         Constraint::Min(1),
     ])
     .areas(area);
@@ -352,7 +352,7 @@ fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let area = panel(frame, area, " Offline demo / review before running ", t);
     let [body, action] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(if area.height >= 20 { 3 } else { 2 }),
+        Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
     ])
     .areas(area);
     let scroll = paragraph(
@@ -387,7 +387,7 @@ fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
 /// One terminal-sized button treatment for primary actions. The last row is
 /// spacing, not part of the button; short viewports use a one-line version.
 fn primary_action(frame: &mut Frame, area: Rect, label: &str, hint: &str, theme: Theme) {
-    let height = if area.height >= 3 { 2 } else { 1 };
+    let height = if area.height >= 4 { 3 } else { 1 };
     let width = 26.min(area.width);
     let style = if theme.bg == Color::Reset {
         theme
@@ -401,6 +401,18 @@ fn primary_action(frame: &mut Frame, area: Rect, label: &str, hint: &str, theme:
     };
     let button = Rect::new(area.x, area.y, width, height);
     frame.render_widget(Block::default().style(style), button);
+    if height == 3 && theme.bg != Color::Reset {
+        // Half-cell caps retain a two-cell visual height while placing the
+        // label between equal top and bottom padding. Monochrome uses full
+        // rows because the user's foreground/background colors are unknown.
+        let edge = Style::default().fg(theme.fg).bg(theme.bg);
+        for (y, glyph) in [(button.y, "▄"), (button.y + 2, "▀")] {
+            frame.render_widget(
+                Paragraph::new(glyph.repeat(usize::from(width))).style(edge),
+                Rect::new(button.x, y, width, 1),
+            );
+        }
+    }
     frame.render_widget(
         Paragraph::new(label)
             .alignment(Alignment::Center)
@@ -650,7 +662,7 @@ mod tests {
 
     #[test]
     fn primary_buttons_share_dimensions_and_center_labels() {
-        for height in [2, 3] {
+        for height in [2, 4] {
             for label in [
                 "Review offline demo ↵",
                 "Open CLI reference ↵",
@@ -662,10 +674,16 @@ mod tests {
                     .draw(|frame| primary_action(frame, frame.area(), label, "Esc back", theme))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
-                let button_height = if height == 3 { 2 } else { 1 };
+                let button_height = if height == 4 { 3 } else { 1 };
                 for y in 0..button_height {
                     for x in 0..26 {
-                        assert_eq!(buffer[(x, y)].bg, theme.fg);
+                        if button_height == 3 && y != 1 {
+                            assert_eq!(buffer[(x, y)].symbol(), if y == 0 { "▄" } else { "▀" });
+                            assert_eq!(buffer[(x, y)].fg, theme.fg);
+                            assert_eq!(buffer[(x, y)].bg, theme.bg);
+                        } else {
+                            assert_eq!(buffer[(x, y)].bg, theme.fg);
+                        }
                     }
                     assert_ne!(buffer[(26, y)].bg, theme.fg);
                 }
