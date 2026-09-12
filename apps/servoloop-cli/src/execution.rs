@@ -1,6 +1,6 @@
 use crate::{
     args::{has, machine_output, prompt_from_args, value},
-    commands::{configured_provider, setting},
+    commands::{configured_provider_with_key, setting},
     config::{store, Config},
     journal_tool::JournalTool,
     output::{redact_value, redacted_session, NdjsonOutput, RunOutput},
@@ -8,7 +8,7 @@ use crate::{
 };
 use serde_json::json;
 use servoloop_core::{AgentLoop, Event as AgentEvent, LoopConfig, Model, StopToken, ToolRegistry};
-use servoloop_providers::OpenAiCompatProvider;
+use servoloop_providers::{OpenAiCompatProvider, Secret};
 use servoloop_store::{new_id, JournalRecord, SessionGuard, SCHEMA_VERSION};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -19,6 +19,7 @@ struct RunControl {
     output: Arc<dyn RunOutput>,
     stop: StopToken,
     listen_for_signal: bool,
+    provider_key: Option<Secret>,
 }
 
 impl RunControl {
@@ -29,6 +30,7 @@ impl RunControl {
             }),
             stop: StopToken::new(),
             listen_for_signal: true,
+            provider_key: None,
         }
     }
 }
@@ -53,6 +55,7 @@ pub(crate) async fn interactive_demo(
             output,
             stop,
             listen_for_signal: false,
+            provider_key: None,
         },
     )
     .await
@@ -91,6 +94,15 @@ fn ensure_driver(args: &[String], cfg: &Config) -> Result<(), String> {
 }
 
 fn model(args: &[String], cfg: &Config, demo: bool) -> Result<Arc<dyn Model>, String> {
+    model_with_key(args, cfg, demo, None)
+}
+
+fn model_with_key(
+    args: &[String],
+    cfg: &Config,
+    demo: bool,
+    key: Option<Secret>,
+) -> Result<Arc<dyn Model>, String> {
     if demo {
         return Ok(Arc::new(DemoModel(Mutex::new(0))));
     }
@@ -103,7 +115,7 @@ fn model(args: &[String], cfg: &Config, demo: bool) -> Result<Arc<dyn Model>, St
     .ok_or("--provider is required")?;
     let model_name = setting(args, "--model", "SERVOLOOP_MODEL", cfg.model.clone())
         .ok_or("--model is required")?;
-    let spec = configured_provider(
+    let spec = configured_provider_with_key(
         &name,
         setting(
             args,
@@ -112,6 +124,7 @@ fn model(args: &[String], cfg: &Config, demo: bool) -> Result<Arc<dyn Model>, St
             cfg.base_url.clone(),
         ),
         cfg,
+        key,
     )?;
     spec.validate().map_err(|e| format!("provider: {e}"))?;
     Ok(Arc::new(
@@ -130,11 +143,13 @@ pub(crate) async fn interactive_request(
     cfg: &Config,
     output: Arc<dyn RunOutput>,
     stop: StopToken,
+    key: Option<Secret>,
 ) -> Result<i32, String> {
     let control = RunControl {
         output,
         stop,
         listen_for_signal: false,
+        provider_key: key.clone(),
     };
     if args.first().map(String::as_str) == Some("resume") {
         return resume_controlled(args, cfg, control).await;
@@ -143,7 +158,7 @@ pub(crate) async fn interactive_request(
     run_loop(
         args,
         cfg,
-        model(args, cfg, false)?,
+        model_with_key(args, cfg, false, key)?,
         prompt_from_args(args)?,
         false,
         None,
@@ -173,7 +188,7 @@ async fn resume_controlled(
         return Err("session has unresolved tool outcomes; refusing to resume".into());
     }
     let prompt = prompt_from_args(args)?;
-    let model = model(args, cfg, has(args, "--demo"))?;
+    let model = model_with_key(args, cfg, has(args, "--demo"), control.provider_key.clone())?;
     run_loop(
         args,
         cfg,

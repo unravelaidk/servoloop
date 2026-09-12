@@ -49,6 +49,13 @@ Catalog downloads have a separate 16 MiB cap because the combined catalog
 exceeds the ordinary provider-response cap of 4 MiB. Both JSON limits are
 enforced while receiving chunks, including responses without Content-Length.
 
+Provider setup also offers masked API-key entry. Entered keys stay in memory,
+override environment credentials for the matching provider and endpoint, and
+work for discovery, execution, and continuation. Escape cancels entry; Ctrl+R
+forgets the workspace key and restores environment fallback. Configuration
+saves never include keys. A fresh process needs another key entry or an
+environment credential. Browser/OAuth login is not implemented.
+
 ![Searchable provider popup over the Paper-style configuration view](images/terminal-provider-picker.png)
 
 ![Model popup showing discovered models and capability metadata from a local test fixture](images/terminal-model-picker.png)

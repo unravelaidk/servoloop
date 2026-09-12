@@ -63,11 +63,21 @@ the endpoint listed it. Catalog-only entries are not proof of account access,
 and unknown capabilities stay unknown. If discovery fails, type an exact model
 ID and select **Use custom model**. Selecting does not send a prompt or save
 settings. **Save and continue** explicitly commits the configuration, including
-the catalog connection metadata, and applies it to the next run. Credential
-values are read from the referenced environment variables, redacted from output
-and snapshots, and never included in saved settings. Catalog lookup sends no
-provider credentials. Unsupported authentication schemes are rejected instead
-of reading arbitrary environment variables from remote catalog data.
+the catalog connection metadata, and applies it to the next run.
+
+To enter an API key, select **Authentication / Enter API key** in provider setup.
+Type or paste the key into the masked field, then press **Enter** to use it or
+**Esc** to cancel. Entered keys override environment credentials for that
+provider and endpoint in the current workspace only. **Ctrl+R** in the key dialog
+forgets the workspace key and restores environment fallback. Changing the
+endpoint does not forward the entered key to the new destination.
+
+Keys stay in memory and are not saved by **Save and continue**. After restarting,
+enter the key again or configure the referenced environment variable. Credential
+values are redacted from output and snapshots and never included in saved
+settings. Catalog lookup sends no provider credentials. Browser/OAuth login is
+not implemented; providers requiring it still need a dedicated integration.
+Unsupported credential references do not cause arbitrary environment reads.
 
 ### Conversations and saved sessions
 

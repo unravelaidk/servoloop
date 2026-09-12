@@ -220,6 +220,9 @@ pub(super) fn draw_workspace(
     if let Some(workspace) = workspace.filter(|w| w.picker.is_some()) {
         picker_popup(frame, workspace, theme);
     }
+    if let Some(workspace) = workspace.filter(|w| w.key_entry.is_some()) {
+        key_popup(frame, workspace, theme);
+    }
     rendered_scroll
 }
 
@@ -860,8 +863,90 @@ fn picker_popup(frame: &mut Frame, workspace: &super::workspace::Workspace, them
     );
 }
 
+fn key_popup(frame: &mut Frame, workspace: &super::workspace::Workspace, theme: Theme) {
+    use super::state::safe_text;
+    let entry = workspace.key_entry.as_ref().expect("key entry is open");
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(76);
+    let height = screen.height.saturating_sub(2).min(16);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Line::styled(" Add API key ", theme.title()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.text().fg(theme.accent))
+        .style(theme.text())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [context, input, explanation, actions] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(2),
+        Constraint::Length(3),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(safe_text(&entry.provider), theme.title()),
+            Line::styled(safe_text(&entry.endpoint), theme.subdued()),
+        ]),
+        context,
+    );
+    let masked = entry.masked();
+    frame.render_widget(
+        Paragraph::new(if masked.is_empty() {
+            "Paste or type API key…".into()
+        } else {
+            format!("{masked}▏")
+        })
+        .style(theme.accent())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" API key / hidden ")
+                .border_style(theme.text().fg(theme.line))
+                .padding(Padding::horizontal(1)),
+        ),
+        input,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                entry
+                    .error
+                    .unwrap_or("Memory only. Never saved to config or history."),
+                theme.subdued(),
+            ),
+            Line::styled("Scoped to this provider and endpoint.", theme.subdued()),
+            Line::styled(
+                "Browser login is not implemented in ServoLoop.",
+                theme.subdued(),
+            ),
+        ])
+        .wrap(Wrap { trim: false }),
+        explanation,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("Enter use key   Esc cancel", theme.accent()),
+            Line::styled("Ctrl+R forget workspace key", theme.subdued()),
+        ]),
+        actions,
+    );
+}
+
 fn workspace_keys(workspace: &super::workspace::Workspace) -> &'static str {
     use super::workspace::Page;
+    if workspace.key_entry.is_some() {
+        return "API key hidden  Enter use key  Esc cancel";
+    }
     if workspace.picker.is_some() {
         return "Type to search  ↑ ↓ choose  Enter select  Esc cancel";
     }
@@ -937,6 +1022,7 @@ fn workspace_view(
                         &workspace.endpoint
                     },
                 ),
+                ("Authentication  /  Enter API key", source.as_str()),
                 (
                     "Model ID",
                     if workspace.model.is_empty() {
@@ -970,13 +1056,13 @@ fn workspace_view(
                 lines.push(Line::from(""));
             }
             lines.push(Line::styled(
-                format!("Credential source: {source} · value hidden"),
+                "Entered keys stay in memory; environment credentials also work.",
                 t.subdued(),
             ));
             lines.push(Line::from(""));
             for (index, label) in [
-                (3, "Test connection / choose a model"),
-                (4, "Save and continue"),
+                (4, "Test connection / choose a model"),
+                (5, "Save and continue"),
             ] {
                 lines.push(Line::styled(
                     format!(
@@ -1177,8 +1263,9 @@ fn workspace_view(
             0 => 5,
             1 => 8,
             2 => 11,
-            3 => 16,
-            _ => 17,
+            3 => 14,
+            4 => 18,
+            _ => 19,
         },
         _ => 0,
     };

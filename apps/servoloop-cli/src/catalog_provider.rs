@@ -35,6 +35,14 @@ impl CatalogConnection {
     }
 
     pub fn spec(&self, endpoint_override: Option<String>) -> Result<ProviderSpec, String> {
+        self.spec_with_key(endpoint_override, None)
+    }
+
+    pub fn spec_with_key(
+        &self,
+        endpoint_override: Option<String>,
+        entered_key: Option<Secret>,
+    ) -> Result<ProviderSpec, String> {
         if self.id.is_empty()
             || self.id.len() > 128
             || !self
@@ -61,15 +69,20 @@ impl CatalogConnection {
         }
         // Do not read arbitrary environment variables named by remote data.
         // Multi-variable authentication schemes need their own adapter.
-        if self
-            .credential_env
-            .iter()
-            .any(|name| !credential_reference(name))
+        if entered_key.is_none()
+            && self
+                .credential_env
+                .iter()
+                .any(|name| !credential_reference(name))
         {
             return Err("Catalog uses an unsupported credential reference. No environment values were read.".into());
         }
-        let mut key = None;
-        for name in &self.credential_env {
+        let mut key = entered_key;
+        let entered = key.is_some();
+        if let Some(key) = &key {
+            crate::output::register_secret(key.as_str());
+        }
+        for name in self.credential_env.iter().filter(|_| !entered) {
             if let Ok(value) = std::env::var(name) {
                 if !value.is_empty() {
                     crate::output::register_secret(&value);
@@ -80,7 +93,7 @@ impl CatalogConnection {
             }
         }
         let mut spec = ProviderSpec::custom(self.id.clone(), self.name.clone(), endpoint, key);
-        spec.key_policy = if self.credential_env.is_empty() {
+        spec.key_policy = if self.credential_env.is_empty() && !entered {
             KeyPolicy::Keyless
         } else {
             KeyPolicy::Required

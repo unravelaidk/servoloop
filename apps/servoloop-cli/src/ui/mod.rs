@@ -299,7 +299,7 @@ async fn interact(
                         else { nav.key(key, snapshot.phase, task.is_some()) }
                     }
                     else if nav.screen == Screen::Workspace {
-                        if key.code == KeyCode::Char('q') && !workspace.editing && workspace.picker.is_none() {
+                        if key.code == KeyCode::Char('q') && !workspace.editing && workspace.picker.is_none() && workspace.key_entry.is_none() {
                             nav.key(key, snapshot.phase, task.is_some())
                         } else {
                             match workspace.key(key, args, task.is_some()) {
@@ -309,7 +309,7 @@ async fn interact(
                                 workspace::Intent::Help => { nav.previous = Screen::Workspace; nav.screen = Screen::Help; nav.scroll = 0; Action::None },
                                 workspace::Intent::Send => Action::Send,
                                 workspace::Intent::None => {
-                                    if matches!(key.code, KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home) && !workspace.editing && workspace.picker.is_none() {
+                                    if matches!(key.code, KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home) && !workspace.editing && workspace.picker.is_none() && workspace.key_entry.is_none() {
                                         nav.key(key, snapshot.phase, task.is_some());
                                     }
                                     Action::None
@@ -371,6 +371,7 @@ async fn interact(
                 let run_stop = stop.clone();
                 let output = Arc::new(UiOutput(report.clone()));
                 let cfg = workspace.config.clone();
+                let key = workspace.applied_key();
                 workspace
                     .history
                     .push(format!("You: {}", state::safe_text(&workspace.draft)));
@@ -379,7 +380,7 @@ async fn interact(
                 nav.screen = Screen::Activity;
                 nav.scroll = 0;
                 *task = Some(tokio::spawn(async move {
-                    execution::interactive_request(&run_args, &cfg, output, run_stop).await
+                    execution::interactive_request(&run_args, &cfg, output, run_stop, key).await
                 }));
             }
             Action::Start => {

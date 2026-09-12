@@ -179,6 +179,7 @@ def main():
                 catalog_error = True
                 extra_provider = False
                 catalog_requests = 0
+                expected_key = "workspace-fixture-key"
                 def log_message(self, *unused):
                     pass
 
@@ -219,9 +220,9 @@ def main():
 
                 def do_POST(self):
                     request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                    assert self.headers.get("Authorization") == "Bearer catalog-fixture-secret-value"
+                    assert self.headers.get("Authorization") == f"Bearer {type(self).expected_key}"
                     requests.append(request)
-                    self.reply({"choices": [{"message": {"content": "Local fixture response. No robot tools requested. catalog-fixture-secret-value"}, "finish_reason": "stop"}]})
+                    self.reply({"choices": [{"message": {"content": f"Local fixture response. No robot tools requested. {type(self).expected_key}"}, "finish_reason": "stop"}]})
 
             with ThreadingHTTPServer(("127.0.0.1", 0), ProviderFixture) as provider:
                 thread = threading.Thread(target=provider.serve_forever, daemon=True)
@@ -263,7 +264,15 @@ def main():
                     key("Enter")
                     expect("Provider selected")
                     expect("CATALOG_FIXTURE_API_KEY")
-                    key("Tab", "Tab", "Tab", "Enter")
+                    key("Tab", "Tab", "Enter")
+                    expect("Add API key")
+                    key("workspace-fixture-key")
+                    expect("•" * len("workspace-fixture-key"))
+                    assert "workspace-fixture-key" not in capture(), "API key input was not masked"
+                    artifact("api-key-entry")
+                    key("Enter")
+                    expect("Workspace API key")
+                    key("Tab", "Tab", "Enter")
                     expect("Endpoint returned 1 models")
                     expect("Choose a model")
                     expect("catalog-only-model")
@@ -281,6 +290,7 @@ def main():
                     assert json.loads(config.read_text())["provider"] == "local-catalog-lab"
                     assert json.loads(config.read_text())["provider_profile"]["credential_env"] == ["CATALOG_FIXTURE_API_KEY"]
                     assert "catalog-fixture-secret-value" not in config.read_text()
+                    assert "workspace-fixture-key" not in config.read_text()
                     key("1")
                     expect("Inspect the current joint positions")
                     key("/")
@@ -298,6 +308,8 @@ def main():
                     assert "catalog-fixture-secret-value" not in capture(), "Catalog credential leaked into terminal output"
                     snapshot = next(live_store.glob("*/snapshot.json"))
                     assert "catalog-fixture-secret-value" not in snapshot.read_text(), "Catalog credential leaked into the saved snapshot"
+                    assert "workspace-fixture-key" not in capture(), "Entered credential leaked into terminal output"
+                    assert "workspace-fixture-key" not in snapshot.read_text(), "Entered credential leaked into snapshot"
                     artifact("provider-result")
                     key("/")
                     expect("Search commands")
@@ -320,6 +332,7 @@ def main():
                     expect_exit()
                     # Reload the saved, dynamically sourced connection in a
                     # fresh process and resume without selecting it again.
+                    ProviderFixture.expected_key = "catalog-fixture-secret-value"
                     launch("dark", live_store, catalog_url=f"http://127.0.0.1:{provider.server_port}/catalog.json")
                     key("Down", "Down", "Enter")
                     expect("1 saved sessions")

@@ -8,9 +8,11 @@ use crate::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use servoloop_providers::{
-    CatalogProvider, DiscoveredModel, Discovery, DiscoveryOptions, ProviderSpec, ToolSupport,
+    CatalogProvider, DiscoveredModel, Discovery, DiscoveryOptions, ProviderSpec, Secret,
+    ToolSupport,
 };
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -54,6 +56,19 @@ pub(super) struct Picker {
     pub selected: usize,
 }
 
+pub(super) struct KeyEntry {
+    pub provider: String,
+    pub endpoint: String,
+    value: String,
+    pub error: Option<&'static str>,
+}
+
+impl KeyEntry {
+    pub fn masked(&self) -> String {
+        "•".repeat(self.value.chars().count().min(32))
+    }
+}
+
 pub(super) struct Choice {
     pub id: String,
     pub title: String,
@@ -84,6 +99,8 @@ pub(super) struct Workspace {
     pub preflight_ok: bool,
     pub settings: Option<super::settings::Settings>,
     pub picker: Option<Picker>,
+    pub key_entry: Option<KeyEntry>,
+    keys: HashMap<(String, String), Secret>,
     discovery: Arc<Discovery>,
     job: Option<JoinHandle<Result<Loaded, String>>>,
 }
@@ -98,7 +115,9 @@ impl Drop for Workspace {
 
 impl Workspace {
     pub fn paste(&mut self, text: &str) {
-        let target = if let Some(picker) = &mut self.picker {
+        let target = if let Some(entry) = &mut self.key_entry {
+            &mut entry.value
+        } else if let Some(picker) = &mut self.picker {
             picker.selected = 0;
             &mut picker.query
         } else if self.editing {
@@ -152,6 +171,8 @@ impl Workspace {
             preflight_ok: false,
             settings: None,
             picker: None,
+            key_entry: None,
+            keys: HashMap::new(),
             discovery: Arc::new(Discovery::new()),
             job: None,
         }
@@ -162,6 +183,9 @@ impl Workspace {
     }
 
     pub fn credential_source(&self) -> String {
+        if self.pending_key().is_some() {
+            return "Workspace API key · memory only".into();
+        }
         if let Some(profile) = self
             .pending_profile
             .as_ref()
@@ -185,6 +209,7 @@ impl Workspace {
     }
 
     pub fn open(&mut self, page: Page, args: &[String]) {
+        self.key_entry = None;
         self.picker = None;
         self.cancel_job();
         self.page = page;
@@ -306,6 +331,10 @@ impl Workspace {
     }
 
     pub fn key(&mut self, key: KeyEvent, args: &[String], running: bool) -> Intent {
+        if self.key_entry.is_some() {
+            self.key_entry_key(key);
+            return Intent::None;
+        }
         if self.picker.is_some() {
             self.picker_key(key);
             return Intent::None;
@@ -350,14 +379,15 @@ impl Workspace {
         }
         match self.page {
             Page::Setup => match key.code {
-                KeyCode::Tab | KeyCode::Down => self.field = (self.field + 1) % 5,
-                KeyCode::BackTab | KeyCode::Up => self.field = (self.field + 4) % 5,
+                KeyCode::Tab | KeyCode::Down => self.field = (self.field + 1) % 6,
+                KeyCode::BackTab | KeyCode::Up => self.field = (self.field + 5) % 6,
                 KeyCode::Enter if self.field == 0 => self.open_picker(PickerKind::Provider),
                 KeyCode::Enter if self.field == 1 => self.editing = true,
-                KeyCode::Enter if self.field == 2 || self.field == 3 => {
+                KeyCode::Enter if self.field == 2 => self.begin_key_entry(),
+                KeyCode::Enter if self.field == 3 || self.field == 4 => {
                     self.open_picker(PickerKind::Model)
                 }
-                KeyCode::Enter if self.field == 4 => self.apply(),
+                KeyCode::Enter if self.field == 5 => self.apply(),
                 _ => {}
             },
             Page::Sessions => match key.code {
@@ -391,7 +421,7 @@ impl Workspace {
             Page::Conversation => match key.code {
                 KeyCode::Char('m') => {
                     self.open(Page::Setup, args);
-                    self.field = 2;
+                    self.field = 3;
                     self.open_picker(PickerKind::Model);
                 }
                 KeyCode::Char('e') => self.editing = true,
@@ -726,10 +756,111 @@ impl Workspace {
             .as_ref()
             .filter(|p| p.id == self.provider)
         {
-            profile.spec(base)
+            if let Some(key) = self.pending_key() {
+                profile.spec_with_key(base, Some(key))
+            } else {
+                profile.spec(base)
+            }
         } else {
-            provider(&self.provider, base)
+            provider(&self.provider, base).map(|spec| {
+                if let Some(key) = self.pending_key() {
+                    spec.with_key(key)
+                } else {
+                    spec
+                }
+            })
         }
+    }
+
+    fn binding(
+        name: &str,
+        endpoint: &str,
+        profile: Option<&CatalogConnection>,
+    ) -> Result<(String, String), String> {
+        let endpoint = if !endpoint.is_empty() {
+            endpoint.to_owned()
+        } else if let Some(profile) = profile.filter(|p| p.id == name) {
+            profile.endpoint.clone()
+        } else {
+            provider(name, None)?.resolve_endpoint()
+        };
+        validate_endpoint(&endpoint)?;
+        if endpoint.is_empty() {
+            return Err("Choose a provider endpoint before entering an API key.".into());
+        }
+        Ok((name.to_owned(), endpoint.trim_end_matches('/').to_owned()))
+    }
+
+    fn pending_key(&self) -> Option<Secret> {
+        Self::binding(
+            &self.provider,
+            &self.endpoint,
+            self.pending_profile.as_ref(),
+        )
+        .ok()
+        .and_then(|binding| self.keys.get(&binding).cloned())
+    }
+
+    pub fn applied_key(&self) -> Option<Secret> {
+        Self::binding(
+            self.config.provider.as_deref()?,
+            self.config.base_url.as_deref().unwrap_or(""),
+            self.config.provider_profile.as_ref(),
+        )
+        .ok()
+        .and_then(|binding| self.keys.get(&binding).cloned())
+    }
+
+    fn begin_key_entry(&mut self) {
+        match Self::binding(
+            &self.provider,
+            &self.endpoint,
+            self.pending_profile.as_ref(),
+        ) {
+            Ok((provider, endpoint)) => {
+                self.cancel_job();
+                self.key_entry = Some(KeyEntry {
+                    provider,
+                    endpoint,
+                    value: String::new(),
+                    error: None,
+                });
+                self.status =
+                    "Enter an API key for this workspace only. Nothing is saved to disk.".into();
+            }
+            Err(error) => self.status = safe_text(&error),
+        }
+    }
+
+    fn key_entry_key(&mut self, key: KeyEvent) {
+        let mut entry = self.key_entry.take().expect("API key entry open");
+        if key.code == KeyCode::Esc {
+            self.status = "API key entry cancelled. Existing credentials unchanged.".into();
+            return;
+        }
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.keys.remove(&(entry.provider, entry.endpoint));
+            self.status =
+                "Workspace key removed. Environment credentials will be used if configured.".into();
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            let value = entry.value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic()) {
+                entry.error = Some("Enter a non-empty key without spaces.");
+                self.status =
+                    "Enter a non-empty API key without whitespace or control characters.".into();
+            } else {
+                crate::output::register_secret(value);
+                self.keys
+                    .insert((entry.provider, entry.endpoint), Secret::new(value));
+                self.status = "API key added for this workspace only. Save settings to apply pending provider/model changes.".into();
+                return;
+            }
+        } else {
+            edit(&mut entry.value, key);
+        }
+        self.key_entry = Some(entry);
     }
 
     fn load_catalog(&mut self, force: bool) {
@@ -804,6 +935,16 @@ impl Workspace {
             .model
             .as_ref()
             .ok_or("Choose a model before Send.")?;
+        crate::commands::configured_provider_with_key(
+            provider_name,
+            self.config.base_url.clone(),
+            &self.config,
+            self.applied_key(),
+        )?
+        .validate()
+        .map_err(|e| {
+            format!("Authentication is not ready: {e}. Open provider setup to add an API key.")
+        })?;
         let mut run = vec![
             "run".into(),
             "--store".into(),
@@ -915,6 +1056,40 @@ mod tests {
                 std::fs::remove_dir_all(&self.0).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn entered_key_is_masked_cancel_safe_and_scoped_to_provider_endpoint() {
+        let mut w = workspace();
+        w.begin_key_entry();
+        w.paste("workspace-unit-key");
+        assert!(!w
+            .key_entry
+            .as_ref()
+            .unwrap()
+            .masked()
+            .contains("workspace-unit-key"));
+        assert!(w.pending_key().is_none());
+        w.key_entry_key(key(KeyCode::Enter));
+        assert_eq!(w.pending_key().unwrap().as_str(), "workspace-unit-key");
+        assert!(w.applied_key().is_some());
+        assert!(!serde_json::to_string(&w.config)
+            .unwrap()
+            .contains("workspace-unit-key"));
+        w.begin_key_entry();
+        w.paste("replacement");
+        w.key_entry_key(key(KeyCode::Esc));
+        assert_eq!(w.pending_key().unwrap().as_str(), "workspace-unit-key");
+        w.endpoint = "https://different.invalid/v1".into();
+        assert!(w.pending_key().is_none());
+        assert!(w.applied_key().is_some());
+        w.endpoint.clear();
+        w.provider = "openrouter".into();
+        assert!(w.pending_key().is_none());
+        w.provider = "ollama".into();
+        w.begin_key_entry();
+        w.key_entry_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(w.pending_key().is_none());
     }
 
     #[test]

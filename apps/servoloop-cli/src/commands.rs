@@ -16,10 +16,28 @@ pub(crate) fn configured_provider(
     base: Option<String>,
     cfg: &Config,
 ) -> Result<ProviderSpec, String> {
+    configured_provider_with_key(name, base, cfg, None)
+}
+
+pub(crate) fn configured_provider_with_key(
+    name: &str,
+    base: Option<String>,
+    cfg: &Config,
+    key: Option<servoloop_providers::Secret>,
+) -> Result<ProviderSpec, String> {
+    if let Some(key) = &key {
+        crate::output::register_secret(key.as_str());
+    }
     if let Some(profile) = cfg.provider_profile.as_ref().filter(|p| p.id == name) {
-        profile.spec(base)
+        profile.spec_with_key(base, key)
     } else {
-        provider(name, base)
+        provider(name, base).map(|spec| {
+            if let Some(key) = key {
+                spec.with_key(key)
+            } else {
+                spec
+            }
+        })
     }
 }
 
