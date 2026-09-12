@@ -4,6 +4,7 @@
   "packageManager": "pnpm@10.15.0",
   "scripts": {
     "test:npm": "node --test packages/servoloop/test/*.test.mjs",
+    "test:pack": "node --test scripts/pack-npm.test.mjs",
     "pack:npm": "node scripts/pack-npm.mjs",
     "test:npm:install": "bash scripts/test-npm-install.sh"
   }

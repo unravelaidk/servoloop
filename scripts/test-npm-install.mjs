@@ -16,7 +16,8 @@ const [, , binary, version = '0.1.0', target] = process.argv;
 if (!binary || !target) throw new Error('usage: node scripts/test-npm-install.mjs BINARY VERSION TARGET');
 const root = resolve(import.meta.dirname, '..');
 const tmp = await mkdtemp(join(tmpdir(), 'servoloop-pnpm-smoke-'));
-const npmExecPath = process.env.npm_execpath;
+const npmExecPath = /(?:^|[/\\])npm-cli\.js$/.test(process.env.npm_execpath || '')
+  ? process.env.npm_execpath : undefined;
 const npm = npmExecPath || [
   join(resolve(process.execPath, '..'), 'node_modules/npm/bin/npm-cli.js'),
   join(resolve(process.execPath, '../..'), 'lib/node_modules/npm/bin/npm-cli.js')

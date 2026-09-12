@@ -68,9 +68,10 @@ jobs:
           set -euo pipefail
           bin="target/release/servoloop"
           [[ "${{ runner.os }}" == "Windows" ]] && bin="target/release/servoloop.exe"
-          "$bin" --version
+          [[ "$("$bin" --version 2>&1)" == "servoloop ${VERSION:-0.1.0}" ]]
           "$bin" --help
-          "$bin" run --demo --store "$RUNNER_TEMP/servoloop-store" >/dev/null
+          demo_output=$("$bin" run --demo --store "$RUNNER_TEMP/servoloop-store")
+          [[ "$demo_output" == *'"event":"session_finished"'* ]]
       - name: Create archive and checksums
         shell: bash
         env:
