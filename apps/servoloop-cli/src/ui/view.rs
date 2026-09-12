@@ -254,7 +254,7 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let [intro, menu, button, note] = Layout::vertical([
         Constraint::Length(if area.height >= 17 { 6 } else { 5 }),
         Constraint::Length(7),
-        Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
+        Constraint::Length(if area.height >= 20 { 3 } else { 2 }),
         Constraint::Min(1),
     ])
     .areas(area);
@@ -352,7 +352,7 @@ fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let area = panel(frame, area, " Offline demo / review before running ", t);
     let [body, action] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
+        Constraint::Length(if area.height >= 20 { 3 } else { 2 }),
     ])
     .areas(area);
     let scroll = paragraph(
@@ -387,8 +387,8 @@ fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
 /// One terminal-sized button treatment for primary actions. The last row is
 /// spacing, not part of the button; short viewports use a one-line version.
 fn primary_action(frame: &mut Frame, area: Rect, label: &str, hint: &str, theme: Theme) {
-    let height = if area.height >= 4 { 3 } else { 1 };
-    let width = 28.min(area.width);
+    let height = if area.height >= 3 { 2 } else { 1 };
+    let width = 26.min(area.width);
     let style = if theme.bg == Color::Reset {
         theme
             .text()
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn primary_buttons_share_dimensions_and_center_labels() {
-        for height in [2, 4] {
+        for height in [2, 3] {
             for label in [
                 "Review offline demo ↵",
                 "Open CLI reference ↵",
@@ -662,14 +662,14 @@ mod tests {
                     .draw(|frame| primary_action(frame, frame.area(), label, "Esc back", theme))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
-                let button_height = if height == 4 { 3 } else { 1 };
+                let button_height = if height == 3 { 2 } else { 1 };
                 for y in 0..button_height {
-                    for x in 0..28 {
+                    for x in 0..26 {
                         assert_eq!(buffer[(x, y)].bg, theme.fg);
                     }
-                    assert_ne!(buffer[(28, y)].bg, theme.fg);
+                    assert_ne!(buffer[(26, y)].bg, theme.fg);
                 }
-                let text: String = (0..28)
+                let text: String = (0..26)
                     .map(|x| buffer[(x, button_height / 2)].symbol())
                     .collect();
                 assert!(text.contains(label));
