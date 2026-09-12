@@ -254,7 +254,7 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let [intro, menu, button, note] = Layout::vertical([
         Constraint::Length(if area.height >= 17 { 6 } else { 5 }),
         Constraint::Length(7),
-        Constraint::Length(2),
+        Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
         Constraint::Min(1),
     ])
     .areas(area);
@@ -319,26 +319,16 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
             rows[index],
         );
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                if view.selected == 0 {
-                    " Review offline demo ↵ "
-                } else {
-                    " Open CLI reference ↵ "
-                },
-                if t.bg == Color::Reset {
-                    t.text().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(t.bg)
-                        .bg(t.fg)
-                        .add_modifier(Modifier::BOLD)
-                },
-            ),
-            Span::styled("   ↑ ↓ choose · Enter open", t.subdued()),
-        ])),
+    primary_action(
+        frame,
         button,
+        if view.selected == 0 {
+            "Review offline demo ↵"
+        } else {
+            "Open CLI reference ↵"
+        },
+        "↑ ↓ choose · Enter open",
+        t,
     );
     paragraph(
         frame,
@@ -360,9 +350,14 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
 fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
     let area = panel(frame, area, " Offline demo / review before running ", t);
-    paragraph(
+    let [body, action] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
+    ])
+    .areas(area);
+    let scroll = paragraph(
         frame,
-        area,
+        body,
         vec![
             Line::styled("Review the offline demo", t.title()),
             Line::from(""),
@@ -375,12 +370,52 @@ fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
             Line::from("This is a fixed script, not a free-form AI conversation."),
             Line::from("Configured providers are not contacted."),
             Line::styled(format!("Local records: {}", view.report.store), t.subdued()),
-            Line::from(""),
-            Line::styled("[r] Run this demo", t.accent()),
         ],
         view.scroll,
         t,
-    )
+    );
+    primary_action(
+        frame,
+        action,
+        "[r] Run this demo",
+        "Esc back · r confirms",
+        t,
+    );
+    scroll
+}
+
+/// One terminal-sized button treatment for primary actions. The last row is
+/// spacing, not part of the button; short viewports use a one-line version.
+fn primary_action(frame: &mut Frame, area: Rect, label: &str, hint: &str, theme: Theme) {
+    let height = if area.height >= 4 { 3 } else { 1 };
+    let width = 28.min(area.width);
+    let style = if theme.bg == Color::Reset {
+        theme
+            .text()
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.bg)
+            .bg(theme.fg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let button = Rect::new(area.x, area.y, width, height);
+    frame.render_widget(Block::default().style(style), button);
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(style),
+        Rect::new(button.x, button.y + height / 2, button.width, 1),
+    );
+    let hint_width = area.width.saturating_sub(width + 3);
+    // The persistent footer carries the same shortcuts when a full hint
+    // doesn't fit. Never show a partially clipped keyboard instruction.
+    if Line::from(hint).width() <= usize::from(hint_width) {
+        frame.render_widget(
+            Paragraph::new(hint).style(theme.subdued()),
+            Rect::new(area.x + width + 3, area.y + height / 2, hint_width, 1),
+        );
+    }
 }
 
 fn activity(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
@@ -612,6 +647,36 @@ fn paragraph(
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn primary_buttons_share_dimensions_and_center_labels() {
+        for height in [2, 4] {
+            for label in [
+                "Review offline demo ↵",
+                "Open CLI reference ↵",
+                "[r] Run this demo",
+            ] {
+                let theme = Theme::named("dark");
+                let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+                terminal
+                    .draw(|frame| primary_action(frame, frame.area(), label, "Esc back", theme))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let button_height = if height == 4 { 3 } else { 1 };
+                for y in 0..button_height {
+                    for x in 0..28 {
+                        assert_eq!(buffer[(x, y)].bg, theme.fg);
+                    }
+                    assert_ne!(buffer[(28, y)].bg, theme.fg);
+                }
+                let text: String = (0..28)
+                    .map(|x| buffer[(x, button_height / 2)].symbol())
+                    .collect();
+                assert!(text.contains(label));
+                assert!(text.starts_with(' ') && text.ends_with(' '));
+            }
+        }
+    }
 
     #[test]
     fn text_roles_meet_contrast_target_in_both_explicit_palettes() {
