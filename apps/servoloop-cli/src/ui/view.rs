@@ -761,7 +761,7 @@ fn picker_popup(frame: &mut Frame, workspace: &super::workspace::Workspace, them
             Line::styled(format!("› {}▏", safe_text(&picker.query)), theme.accent()),
             Line::styled(
                 if picker.kind == PickerKind::Provider {
-                    "Search supported providers · no connection on selection".into()
+                    "Search catalog providers · unsupported adapters are labeled".into()
                 } else {
                     format!(
                         "{} · Models.dev + endpoint discovery",
@@ -806,11 +806,15 @@ fn picker_popup(frame: &mut Frame, workspace: &super::workspace::Workspace, them
     if choices.is_empty() {
         frame.render_widget(
             Paragraph::new(if workspace.busy() {
-                "Loading model catalog… You can type a custom ID now."
+                if picker.kind == PickerKind::Provider {
+                    "Loading provider catalog… Escape cancels."
+                } else {
+                    "Loading model catalog… You can type a custom ID now."
+                }
             } else if picker.kind == PickerKind::Model {
                 "No models found. Type an exact ID to add a custom model."
             } else {
-                "No matching provider. Try OpenAI, OpenRouter, NVIDIA, or Ollama."
+                "No matching providers. Change search or press F5 to reload."
             })
             .wrap(Wrap { trim: false })
             .style(theme.subdued()),
@@ -840,7 +844,7 @@ fn picker_popup(frame: &mut Frame, workspace: &super::workspace::Workspace, them
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                if width >= 70 && picker.kind == PickerKind::Model {
+                if width >= 70 {
                     "↑ ↓ navigate   Enter select   Esc cancel   F5 refresh"
                 } else {
                     "↑ ↓ choose  Enter select  Esc cancel"
@@ -922,12 +926,7 @@ fn workspace_view(
                 t.subdued(),
             ));
             lines.push(Line::from(""));
-            let source = match workspace.provider.as_str() {
-                "openrouter" => "OPENROUTER_API_KEY",
-                "nvidia" => "NVIDIA_API_KEY",
-                "ollama" => "No credential required",
-                _ => "OPENAI_API_KEY",
-            };
+            let source = workspace.credential_source();
             for (index, (label, value)) in [
                 ("Provider  /  Enter to choose", workspace.provider.as_str()),
                 (

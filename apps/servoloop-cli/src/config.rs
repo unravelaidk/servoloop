@@ -7,6 +7,8 @@ pub(crate) struct Config {
     pub(crate) base_url: Option<String>,
     pub(crate) store: Option<PathBuf>,
     pub(crate) driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_profile: Option<crate::catalog_provider::CatalogConnection>,
 }
 
 fn init_config(args: &[String]) -> Result<(), String> {

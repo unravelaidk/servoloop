@@ -66,6 +66,12 @@ pub struct CatalogProvider {
     pub name: String,
     pub base_url: Option<String>,
     pub api_key_required: bool,
+    /// Catalog adapter package. An unknown package is not proof of protocol compatibility.
+    #[serde(default)]
+    pub npm: String,
+    /// Credential environment variable references, never credential values.
+    #[serde(default)]
+    pub env: Vec<String>,
     pub models: Vec<CatalogModel>,
 }
 
@@ -192,7 +198,7 @@ impl Discovery {
         // this makes an env-provided catalog URL part of cache identity.
         let catalog_url = catalog::resolve_catalog_url(options.models_dev_url_override.as_deref());
         let key = DiscoveryCacheKey::new(
-            spec.id,
+            &spec.id,
             &endpoint,
             &spec.cache_identity(),
             &spec.protocol.to_string(),
@@ -604,6 +610,8 @@ mod tests {
         let spec = ProviderSpec::openai("key");
         let endpoint_models = vec!["gpt-4o-mini".to_string()];
         let catalog = vec![CatalogProvider {
+            npm: "@ai-sdk/openai".into(),
+            env: vec![],
             id: "openai".to_string(),
             name: "OpenAI".to_string(),
             base_url: None,
@@ -652,6 +660,8 @@ mod tests {
         let spec = ProviderSpec::openai("key");
         let endpoint_models: Vec<String> = vec![];
         let catalog = vec![CatalogProvider {
+            npm: "@ai-sdk/openai".into(),
+            env: vec![],
             id: "openai".to_string(),
             name: "OpenAI".to_string(),
             base_url: None,

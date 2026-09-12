@@ -2,15 +2,18 @@
 //! discovery and session inspection are explicit, cancellable operations.
 use super::state::safe_text;
 use crate::{
+    catalog_provider::CatalogConnection,
     commands::provider,
     config::{store, store_path, Config},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use servoloop_providers::{
-    DiscoveredModel, Discovery, DiscoveryOptions, ToolSupport, BUILTIN_NVIDIA, BUILTIN_OLLAMA,
-    BUILTIN_OPENAI, BUILTIN_OPENROUTER,
+    CatalogProvider, DiscoveredModel, Discovery, DiscoveryOptions, ProviderSpec, ToolSupport,
 };
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +36,7 @@ pub(super) enum Intent {
 }
 
 enum Loaded {
+    Providers(Vec<CatalogProvider>),
     Models(Vec<DiscoveredModel>),
     Sessions(Vec<String>),
     Preflight { id: String, history: Vec<String> },
@@ -54,30 +58,7 @@ pub(super) struct Choice {
     pub id: String,
     pub title: String,
     pub detail: String,
-}
-
-fn providers() -> Vec<Choice> {
-    [
-        BUILTIN_OPENAI,
-        BUILTIN_OPENROUTER,
-        BUILTIN_NVIDIA,
-        BUILTIN_OLLAMA,
-    ]
-    .into_iter()
-    .map(|p| Choice {
-        id: p.id.into(),
-        title: p.display_name.into(),
-        detail: format!(
-            "{} · {}",
-            p.default_endpoint,
-            if p.env_key_names.is_empty() {
-                "No API key required".into()
-            } else {
-                p.env_key_names.join(" / ")
-            }
-        ),
-    })
-    .collect()
+    pub enabled: bool,
 }
 
 pub(super) struct Workspace {
@@ -95,6 +76,9 @@ pub(super) struct Workspace {
     pub status: String,
     pub sessions: Vec<String>,
     pub models: Vec<DiscoveredModel>,
+    pub providers: Vec<CatalogProvider>,
+    pub pending_profile: Option<CatalogConnection>,
+    catalog_loaded: Option<Instant>,
     pub session: Option<String>,
     pub history: Vec<String>,
     pub preflight_ok: bool,
@@ -160,6 +144,9 @@ impl Workspace {
             status: String::new(),
             sessions: vec![],
             models: vec![],
+            providers: vec![],
+            pending_profile: cfg.provider_profile.clone(),
+            catalog_loaded: None,
             session: None,
             history: vec![],
             preflight_ok: false,
@@ -174,6 +161,29 @@ impl Workspace {
         self.job.is_some()
     }
 
+    pub fn credential_source(&self) -> String {
+        if let Some(profile) = self
+            .pending_profile
+            .as_ref()
+            .filter(|p| p.id == self.provider)
+        {
+            return if profile.credential_env.is_empty() {
+                "No credential required".into()
+            } else {
+                profile.credential_env.join(" / ")
+            };
+        }
+        provider(&self.provider, None)
+            .map(|spec| {
+                if spec.env_key_names.is_empty() {
+                    "No credential required".into()
+                } else {
+                    spec.env_key_names.join(" / ")
+                }
+            })
+            .unwrap_or_else(|_| "Select a catalog provider".into())
+    }
+
     pub fn open(&mut self, page: Page, args: &[String]) {
         self.picker = None;
         self.cancel_job();
@@ -184,6 +194,7 @@ impl Workspace {
         self.query.clear();
         self.status.clear();
         if page == Page::Setup {
+            self.pending_profile = self.config.provider_profile.clone();
             self.provider = self
                 .config
                 .provider
@@ -227,6 +238,25 @@ impl Workspace {
             .await
             .unwrap_or_else(|e| Err(format!("Background operation failed: {e}")));
         match result {
+            Ok(Loaded::Providers(providers)) => {
+                self.providers = providers;
+                self.catalog_loaded = Some(Instant::now());
+                if let Some(picker) = self
+                    .picker
+                    .as_mut()
+                    .filter(|p| p.kind == PickerKind::Provider && p.query.is_empty())
+                {
+                    picker.selected = self
+                        .providers
+                        .iter()
+                        .position(|p| p.id == self.provider)
+                        .unwrap_or(0);
+                }
+                self.status = format!(
+                    "{} catalog providers · unsupported adapters are labeled · nothing applied",
+                    self.providers.len()
+                );
+            }
             Ok(Loaded::Models(models)) => {
                 let endpoint_count = models.iter().filter(|m| m.from_endpoint).count();
                 self.models = models;
@@ -422,10 +452,7 @@ impl Workspace {
             return;
         }
         self.cancel_job();
-        let spec = match provider(
-            &self.provider,
-            (!self.endpoint.is_empty()).then(|| self.endpoint.clone()),
-        ) {
+        let spec = match self.selected_spec() {
             Ok(spec) => spec,
             Err(error) => {
                 self.status = safe_text(&error);
@@ -452,11 +479,46 @@ impl Workspace {
     pub fn choices(&self, picker: &Picker) -> Vec<Choice> {
         let query = picker.query.trim().to_lowercase();
         let mut choices: Vec<_> = match picker.kind {
-            PickerKind::Provider => providers(),
+            PickerKind::Provider => self
+                .providers
+                .iter()
+                .map(|p| {
+                    let connection = CatalogConnection::from(p);
+                    Choice {
+                        id: p.id.clone(),
+                        title: format!(
+                            "{}{}",
+                            p.name,
+                            if connection.supported() {
+                                ""
+                            } else {
+                                " · unsupported adapter"
+                            }
+                        ),
+                        detail: format!(
+                            "{} · {} models · {} · Credentials: {}",
+                            p.base_url.as_deref().unwrap_or("Endpoint must be entered"),
+                            p.models.len(),
+                            if p.npm.is_empty() {
+                                "Protocol unknown"
+                            } else {
+                                &p.npm
+                            },
+                            if p.env.is_empty() {
+                                "none".into()
+                            } else {
+                                p.env.join(" / ")
+                            }
+                        ),
+                        enabled: connection.supported(),
+                    }
+                })
+                .collect::<Vec<_>>(),
             PickerKind::Model => self
                 .models
                 .iter()
                 .map(|m| Choice {
+                    enabled: true,
                     id: m.model_id.clone(),
                     title: if m.name.is_empty() || m.name == m.model_id {
                         m.model_id.clone()
@@ -505,6 +567,7 @@ impl Workspace {
                 .any(|m| m.model_id == picker.query.trim())
         {
             choices.push(Choice {
+                enabled: true,
                 id: picker.query.trim().into(),
                 title: format!("Use custom model: {}", picker.query.trim()),
                 detail: "Not discovered · capabilities unknown · selection does not test the model"
@@ -524,9 +587,8 @@ impl Workspace {
         if kind == PickerKind::Model {
             self.discover();
         } else {
-            self.status =
-                "Choose a supported provider. Endpoint overrides are edited separately.".into();
-            if let Some(index) = providers().iter().position(|p| p.id == self.provider) {
+            self.load_catalog(false);
+            if let Some(index) = self.providers.iter().position(|p| p.id == self.provider) {
                 self.picker.as_mut().expect("opened picker").selected = index;
             }
         }
@@ -559,19 +621,49 @@ impl Workspace {
                 self.discovery.clear_cache();
                 self.discover();
             }
+            KeyCode::F(5) if picker.kind == PickerKind::Provider => {
+                picker.selected = 0;
+                self.load_catalog(true);
+            }
             KeyCode::Enter => {
                 if let Some(choice) = self.choices(&picker).get(picker.selected) {
+                    if !choice.enabled {
+                        self.status = "This catalog adapter is not implemented. Only OpenAI-compatible Chat Completions can run; selection unchanged.".into();
+                        self.picker = Some(picker);
+                        return;
+                    }
                     match picker.kind {
-                        PickerKind::Provider if choice.id != self.provider => {
-                            self.provider = choice.id.clone();
-                            self.endpoint.clear();
-                            self.model.clear();
-                            self.models.clear();
+                        PickerKind::Provider => {
+                            let entry = self
+                                .providers
+                                .iter()
+                                .find(|p| p.id == choice.id)
+                                .expect("catalog choice");
+                            let profile = CatalogConnection::from(entry);
+                            if choice.id != self.provider {
+                                self.provider = choice.id.clone();
+                                self.endpoint = profile.endpoint.clone();
+                                self.model.clear();
+                                self.models = entry
+                                    .models
+                                    .iter()
+                                    .map(|m| DiscoveredModel {
+                                        provider_id: entry.id.clone(),
+                                        model_id: m.model_id.clone(),
+                                        name: m.name.clone(),
+                                        tool_support: m.tool_support,
+                                        deprecated: m.deprecated,
+                                        reasoning: m.reasoning,
+                                        modalities: m.modalities.clone(),
+                                        context_window: m.context_window,
+                                        max_output: m.max_output,
+                                        from_endpoint: false,
+                                    })
+                                    .collect();
+                            }
+                            self.pending_profile = Some(profile);
                             self.cancel_job();
                             self.status = "Provider selected. Choose a model; Save applies the pending settings.".into();
-                        }
-                        PickerKind::Provider => {
-                            self.status = "Provider selection retained. Nothing saved.".into()
                         }
                         PickerKind::Model => {
                             self.model = choice.id.clone();
@@ -601,10 +693,7 @@ impl Workspace {
             self.status = "Enter an exact model ID before applying.".into();
             return;
         }
-        let spec = provider(
-            &self.provider,
-            (!self.endpoint.is_empty()).then(|| self.endpoint.clone()),
-        );
+        let spec = self.selected_spec();
         if let Err(error) = spec.and_then(|p| p.validate().map_err(|e| e.to_string())) {
             self.status = safe_text(&error);
             return;
@@ -614,6 +703,11 @@ impl Workspace {
         config.provider = Some(self.provider.clone());
         config.model = Some(self.model.clone());
         config.base_url = (!self.endpoint.is_empty()).then(|| self.endpoint.clone());
+        config.provider_profile = self
+            .pending_profile
+            .as_ref()
+            .filter(|p| p.id == self.provider)
+            .cloned();
         if let Some(settings) = &mut self.settings {
             if let Err(error) = settings.save(&config) {
                 self.status = safe_text(&error);
@@ -623,6 +717,45 @@ impl Workspace {
         self.config = config;
         self.page = Page::Conversation;
         self.status = "Settings applied to the next run. Active execution unchanged.".into();
+    }
+
+    fn selected_spec(&self) -> Result<ProviderSpec, String> {
+        let base = (!self.endpoint.is_empty()).then(|| self.endpoint.clone());
+        if let Some(profile) = self
+            .pending_profile
+            .as_ref()
+            .filter(|p| p.id == self.provider)
+        {
+            profile.spec(base)
+        } else {
+            provider(&self.provider, base)
+        }
+    }
+
+    fn load_catalog(&mut self, force: bool) {
+        if !force
+            && self
+                .catalog_loaded
+                .is_some_and(|loaded| loaded.elapsed() < Duration::from_secs(300))
+        {
+            self.status = format!(
+                "{} cached catalog providers · F5 refreshes",
+                self.providers.len()
+            );
+            return;
+        }
+        self.cancel_job();
+        self.status = "Loading provider catalog… No credentials sent to the catalog.".into();
+        self.job = Some(tokio::spawn(async {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                servoloop_providers::catalog::fetch_catalog(None),
+            )
+            .await
+            .map_err(|_| "Provider catalog timed out. Press F5 to retry.".to_string())?
+            .map(Loaded::Providers)
+            .map_err(|e| format!("Provider catalog unavailable: {e}. Press F5 to retry."))
+        }));
     }
 
     fn preflight(&mut self, args: &[String], id: String) {
@@ -739,11 +872,19 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
     fn workspace() -> Workspace {
-        Workspace::new(&Config {
+        let mut workspace = Workspace::new(&Config {
             provider: Some("ollama".into()),
             model: Some("local-test".into()),
             ..Config::default()
-        })
+        });
+        workspace.providers = servoloop_providers::catalog::parse_catalog(&serde_json::json!({
+            "openrouter": {"name":"OpenRouter", "npm":"@ai-sdk/openai-compatible", "api":"https://catalog.example/v1", "env":[], "models":{"test":{"name":"Test"}}},
+            "ollama": {"name":"Ollama", "npm":"@ai-sdk/openai-compatible", "api":"http://localhost:11434/v1", "env":[], "models":{"test":{"name":"Test"}}},
+            "new-catalog-provider": {"name":"New Catalog Provider", "npm":"@ai-sdk/openai-compatible", "api":"https://catalog.example/v1", "env":[], "models":{"test":{"name":"Test"}}},
+            "unsupported": {"name":"Unsupported", "npm":"@ai-sdk/anthropic", "api":"https://catalog.example", "env":[], "models":{"test":{"name":"Test"}}}
+        })).unwrap();
+        workspace.catalog_loaded = Some(Instant::now());
+        workspace
     }
     async fn settle(workspace: &mut Workspace) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -915,9 +1056,29 @@ mod tests {
         }
         w.key(key(KeyCode::Enter), &[], false);
         assert_eq!(w.provider, "openrouter");
-        assert!(w.endpoint.is_empty());
+        assert_eq!(w.endpoint, "https://catalog.example/v1");
         assert!(w.model.is_empty());
         assert_eq!(w.config.provider.as_deref(), Some(original.as_str()));
+    }
+
+    #[test]
+    fn provider_picker_is_catalog_driven_and_refuses_unsupported_adapters() {
+        let mut w = workspace();
+        w.open_picker(PickerKind::Provider);
+        w.paste("new-catalog-provider");
+        w.key(key(KeyCode::Enter), &[], false);
+        assert_eq!(w.provider, "new-catalog-provider");
+        assert_eq!(w.selected_spec().unwrap().id, "new-catalog-provider");
+        assert!(
+            w.config.provider_profile.is_none(),
+            "Selection must not save settings"
+        );
+        w.open_picker(PickerKind::Provider);
+        w.paste("unsupported");
+        assert!(!w.choices(w.picker.as_ref().unwrap())[0].enabled);
+        w.key(key(KeyCode::Enter), &[], false);
+        assert!(w.picker.is_some());
+        assert_eq!(w.provider, "new-catalog-provider");
     }
 
     #[test]

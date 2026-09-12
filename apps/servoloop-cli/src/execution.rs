@@ -1,6 +1,6 @@
 use crate::{
     args::{has, machine_output, prompt_from_args, value},
-    commands::{provider, setting},
+    commands::{configured_provider, setting},
     config::{store, Config},
     journal_tool::JournalTool,
     output::{redact_value, redacted_session, NdjsonOutput, RunOutput},
@@ -103,7 +103,7 @@ fn model(args: &[String], cfg: &Config, demo: bool) -> Result<Arc<dyn Model>, St
     .ok_or("--provider is required")?;
     let model_name = setting(args, "--model", "SERVOLOOP_MODEL", cfg.model.clone())
         .ok_or("--model is required")?;
-    let spec = provider(
+    let spec = configured_provider(
         &name,
         setting(
             args,
@@ -111,6 +111,7 @@ fn model(args: &[String], cfg: &Config, demo: bool) -> Result<Arc<dyn Model>, St
             "SERVOLOOP_BASE_URL",
             cfg.base_url.clone(),
         ),
+        cfg,
     )?;
     spec.validate().map_err(|e| format!("provider: {e}"))?;
     Ok(Arc::new(

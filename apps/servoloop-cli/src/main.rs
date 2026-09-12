@@ -1,6 +1,7 @@
 //! `servoloop`: a deliberately small machine-oriented operator CLI.
 
 mod args;
+mod catalog_provider;
 mod commands;
 mod config;
 mod execution;

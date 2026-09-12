@@ -35,11 +35,19 @@ activity and inspector retain the underlying error and evidence states.
 Provider and model fields open a centered picker over the settings view. Typing
 filters the list; arrows move selection; Enter selects; Escape leaves the
 pending value unchanged. Selection does not save settings or submit a prompt.
-The provider picker uses supported provider definitions. The model picker reuses
-the cached discovery service, merging Models.dev's `api.json` with live endpoint
+The provider picker loads names, endpoints, adapter metadata, and credential
+references from Models.dev's `api.json`; there is no fixed picker list. Unknown
+or unsupported adapters remain visible but cannot execute. The model picker
+reuses the cached discovery service, merging the same catalog with live endpoint
 results. Catalog-only provenance and unknown capabilities remain explicit.
 Custom model IDs remain available when discovery fails. Save is a separate,
 atomic configuration write; in-flight execution retains its original settings.
+Saved catalog connections support newly added compatible provider IDs without
+code registration. They contain credential references only, not values. A
+failed initial catalog fetch shows an error and retry action, not built-in rows.
+Catalog downloads have a separate 16 MiB cap because the combined catalog
+exceeds the ordinary provider-response cap of 4 MiB. Both JSON limits are
+enforced while receiving chunks, including responses without Content-Length.
 
 ![Searchable provider popup over the Paper-style configuration view](images/terminal-provider-picker.png)
 

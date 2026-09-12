@@ -2,6 +2,7 @@
 //! environment variable names, and keyless policy.
 
 use crate::secret::Secret;
+use std::borrow::Cow;
 use std::fmt;
 
 /// The wire protocol used to talk to a provider.
@@ -59,9 +60,9 @@ pub enum KeyPolicy {
 #[derive(Debug, Clone)]
 pub struct ProviderSpec {
     /// Short provider identifier (e.g. `"openai"`, `"nvidia"`).
-    pub id: &'static str,
+    pub id: Cow<'static, str>,
     /// Human-readable name (e.g. `"OpenAI"`).
-    pub display_name: &'static str,
+    pub display_name: Cow<'static, str>,
     /// Wire protocol.
     pub protocol: Protocol,
     /// Default base URL including any `/v1` path prefix.
@@ -93,8 +94,8 @@ impl ProviderSpec {
         key: Secret,
     ) -> Self {
         Self {
-            id,
-            display_name,
+            id: id.into(),
+            display_name: display_name.into(),
             protocol,
             default_endpoint,
             env_key_names,
@@ -150,8 +151,8 @@ impl ProviderSpec {
     /// Ollama (local, keyless) spec.
     pub fn ollama() -> Self {
         Self {
-            id: BUILTIN_OLLAMA.id,
-            display_name: BUILTIN_OLLAMA.display_name,
+            id: BUILTIN_OLLAMA.id.into(),
+            display_name: BUILTIN_OLLAMA.display_name.into(),
             protocol: BUILTIN_OLLAMA.protocol,
             default_endpoint: BUILTIN_OLLAMA.default_endpoint,
             env_key_names: BUILTIN_OLLAMA.env_key_names,
@@ -166,8 +167,8 @@ impl ProviderSpec {
     /// provider. The endpoint must include the `/v1` prefix if the
     /// server expects it.
     pub fn custom(
-        id: &'static str,
-        display_name: &'static str,
+        id: impl Into<Cow<'static, str>>,
+        display_name: impl Into<Cow<'static, str>>,
         endpoint: impl Into<String>,
         key: Option<Secret>,
     ) -> Self {
@@ -177,8 +178,8 @@ impl ProviderSpec {
             KeyPolicy::Keyless
         };
         Self {
-            id,
-            display_name,
+            id: id.into(),
+            display_name: display_name.into(),
             protocol: Protocol::OpenAiChatCompletions,
             default_endpoint: "",
             env_key_names: &[],
@@ -249,7 +250,7 @@ impl ProviderSpec {
             return Err(crate::ProviderError::unsupported_protocol(self.protocol));
         }
         if self.key_policy == KeyPolicy::Required && !self.has_key() {
-            return Err(crate::ProviderError::missing_key(self.id));
+            return Err(crate::ProviderError::missing_key(self.id.to_string()));
         }
         Ok(())
     }
@@ -396,8 +397,8 @@ mod tests {
     #[test]
     fn validate_rejects_unsupported_protocol() {
         let spec = ProviderSpec {
-            id: "test",
-            display_name: "Test",
+            id: "test".into(),
+            display_name: "Test".into(),
             protocol: Protocol::AnthropicMessages,
             default_endpoint: "https://example.com",
             env_key_names: &[],
@@ -417,8 +418,8 @@ mod tests {
     fn validate_rejects_missing_key_when_required() {
         // Use a nonexistent env key name so no env variable can satisfy it.
         let spec = ProviderSpec {
-            id: "test-required",
-            display_name: "Test Required",
+            id: "test-required".into(),
+            display_name: "Test Required".into(),
             protocol: Protocol::OpenAiChatCompletions,
             default_endpoint: "https://example.com/v1",
             env_key_names: &["NONEXISTENT_TEST_KEY_12345"],

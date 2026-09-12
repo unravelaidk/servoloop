@@ -76,6 +76,14 @@ impl Settings {
                 object.remove(name);
             }
         }
+        if let Some(profile) = &config.provider_profile {
+            object.insert(
+                "provider_profile".into(),
+                serde_json::to_value(profile).map_err(|e| e.to_string())?,
+            );
+        } else {
+            object.remove("provider_profile");
+        }
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
         let mut tmp = tempfile::NamedTempFile::new_in(parent)

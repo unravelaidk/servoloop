@@ -38,23 +38,36 @@ session**. Press **/** outside an editor to open the command palette. See the
 In provider setup, use **Tab** to focus a field and **Enter** to open it. Provider
 and model fields open centered, searchable popups. Type to filter, use **Up/Down**
 to navigate, press **Enter** to select, or **Esc** to cancel without changing the
-pending selection. **F5** refreshes model discovery. **m** in a conversation opens
+pending selection. **F5** refreshes either catalog picker. **m** in a conversation opens
 the model picker without discarding your draft.
 
-Providers come from the supported provider definitions, not a separate UI list.
-Models come from the existing discovery service: Models.dev's `api.json`, the
-provider endpoint, and Ollama's native tags endpoint. Set
+Providers come from Models.dev's `api.json`, not a fixed built-in list. Their
+names, endpoints, credential references, and adapter metadata come from the
+catalog. Providers with unsupported or unknown adapters remain visible but
+cannot be selected for execution. OpenAI-compatible catalog connections are
+stored with the selected configuration and work without adding provider IDs to
+the CLI source. Existing built-in CLI configurations remain compatible.
+
+Models come from the existing discovery service: the same Models.dev catalog,
+the provider endpoint, and Ollama's native tags endpoint. Set
 `SERVOLOOP_MODELS_DEV_URL` to an HTTP(S) catalog URL for a compatible mirror or
 local fixture. Opening model selection can contact these services; the offline
-demo never does. Results use the discovery service's in-memory cache.
+demo never does. Provider entries are cached for five minutes; model results
+use the discovery service's in-memory cache. Refresh failure keeps any cached
+entries and shows the error; an initial failure never substitutes a fixed list.
+Catalog responses have a 16 MiB download cap, enforced incrementally. Ordinary
+provider JSON responses retain their separate 4 MiB cap.
 
 Each model shows reported tool/image capabilities, context size, and whether
 the endpoint listed it. Catalog-only entries are not proof of account access,
 and unknown capabilities stay unknown. If discovery fails, type an exact model
 ID and select **Use custom model**. Selecting does not send a prompt or save
-settings. **Save and continue** explicitly commits the configuration and applies
-it to the next run. Credential values are read from environment variables and
-are never part of the saved settings.
+settings. **Save and continue** explicitly commits the configuration, including
+the catalog connection metadata, and applies it to the next run. Credential
+values are read from the referenced environment variables, redacted from output
+and snapshots, and never included in saved settings. Catalog lookup sends no
+provider credentials. Unsupported authentication schemes are rejected instead
+of reading arbitrary environment variables from remote catalog data.
 
 ### Conversations and saved sessions
 

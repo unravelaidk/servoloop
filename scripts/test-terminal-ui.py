@@ -76,6 +76,7 @@ def main():
             ])
             environment = "unset SERVOLOOP_PROVIDER SERVOLOOP_MODEL SERVOLOOP_BASE_URL; "
             environment += "export SERVOLOOP_MODELS_DEV_URL=" + shlex.quote(catalog_url) + "; "
+            environment += "export CATALOG_FIXTURE_API_KEY=catalog-fixture-secret-value; "
             environment += "export NO_COLOR=1; " if no_color else "unset NO_COLOR; "
             shell = (
                 environment + "before=$(stty -g); " + command + "; result=$?; "
@@ -175,11 +176,18 @@ def main():
             # No provider credentials or external service are used.
             requests = []
             class ProviderFixture(BaseHTTPRequestHandler):
+                catalog_error = True
+                extra_provider = False
+                catalog_requests = 0
                 def log_message(self, *unused):
                     pass
 
                 def reply(self, value):
                     body = json.dumps(value).encode()
+                    if self.path == "/catalog.json":
+                        # Match the real catalog size that exceeded the old
+                        # shared 4 MiB cap; exercise this through the actual UI.
+                        body += b" " * max(0, 4_614_121 - len(body))
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
@@ -188,17 +196,32 @@ def main():
 
                 def do_GET(self):
                     if self.path == "/catalog.json":
-                        self.reply({"ollama": {"name": "Ollama", "models": {
+                        assert self.headers.get("Authorization") is None, "Catalog request included provider credentials"
+                        type(self).catalog_requests += 1
+                        if type(self).catalog_error:
+                            self.send_error(503, "Catalog fixture unavailable")
+                            return
+                        model_data = {
                             "fixture-model": {"name": "Fixture", "tool_call": True, "limit": {"context": 8192}},
                             "catalog-only-model": {"name": "Catalog only", "tool_call": False}
-                        }}})
+                        }
+                        catalog = {
+                            "ollama": {"name": "Ollama", "npm": "@ai-sdk/openai-compatible", "api": f"http://127.0.0.1:{self.server.server_port}/v1", "env": [], "models": model_data},
+                            "local-catalog-lab": {"name": "Local Catalog Lab", "npm": "@ai-sdk/openai-compatible", "api": f"http://127.0.0.1:{self.server.server_port}/v1", "env": ["CATALOG_FIXTURE_API_KEY"], "models": model_data},
+                            "unsupported-fixture": {"name": "Unsupported Fixture", "npm": "@ai-sdk/anthropic", "api": "https://unused.invalid", "env": [], "models": model_data}
+                        }
+                        if type(self).extra_provider:
+                            catalog["refresh-added-provider"] = {"name": "Refresh Added Provider", "npm": "@ai-sdk/openai-compatible",
+                                "api": f"http://127.0.0.1:{self.server.server_port}/v1", "env": [], "models": model_data}
+                        self.reply(catalog)
                     else:
                         self.reply({"data": [{"id": "fixture-model"}], "models": [{"name": "fixture-model"}]})
 
                 def do_POST(self):
                     request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    assert self.headers.get("Authorization") == "Bearer catalog-fixture-secret-value"
                     requests.append(request)
-                    self.reply({"choices": [{"message": {"content": "Local fixture response. No robot tools requested."}, "finish_reason": "stop"}]})
+                    self.reply({"choices": [{"message": {"content": "Local fixture response. No robot tools requested. catalog-fixture-secret-value"}, "finish_reason": "stop"}]})
 
             with ThreadingHTTPServer(("127.0.0.1", 0), ProviderFixture) as provider:
                 thread = threading.Thread(target=provider.serve_forever, daemon=True)
@@ -214,6 +237,18 @@ def main():
                     artifact("provider-setup")
                     key("Enter")
                     expect("Choose a provider")
+                    expect("Provider catalog unavailable")
+                    expect("0 matches")
+                    assert not live_store.exists()
+                    ProviderFixture.catalog_error = False
+                    key("F5")
+                    expect("3 matches")
+                    expect("unsupported adapter")
+                    ProviderFixture.extra_provider = True
+                    key("F5")
+                    expect("4 matches")
+                    expect("Refresh Added Provider")
+                    catalog_reads = ProviderFixture.catalog_requests
                     artifact("provider-picker-all")
                     key("q")
                     expect("No matching provider")
@@ -222,6 +257,12 @@ def main():
                     artifact("provider-picker")
                     key("Escape")
                     expect("Selection cancelled")
+                    key("Enter", "local-catalog-lab")
+                    expect("1 matches")
+                    assert ProviderFixture.catalog_requests == catalog_reads, "Provider popup ignored the catalog cache"
+                    key("Enter")
+                    expect("Provider selected")
+                    expect("CATALOG_FIXTURE_API_KEY")
                     key("Tab", "Tab", "Tab", "Enter")
                     expect("Endpoint returned 1 models")
                     expect("Choose a model")
@@ -237,6 +278,9 @@ def main():
                     key("Tab", "Enter")
                     expect("What would you like to test?")
                     assert json.loads(config.read_text())["model"] == "fixture-model"
+                    assert json.loads(config.read_text())["provider"] == "local-catalog-lab"
+                    assert json.loads(config.read_text())["provider_profile"]["credential_env"] == ["CATALOG_FIXTURE_API_KEY"]
+                    assert "catalog-fixture-secret-value" not in config.read_text()
                     key("1")
                     expect("Inspect the current joint positions")
                     key("/")
@@ -251,6 +295,9 @@ def main():
                     expect("Local fixture response")
                     assert len(requests) == 1
                     assert "Position verified:" not in capture(), "Model prose became physical verification"
+                    assert "catalog-fixture-secret-value" not in capture(), "Catalog credential leaked into terminal output"
+                    snapshot = next(live_store.glob("*/snapshot.json"))
+                    assert "catalog-fixture-secret-value" not in snapshot.read_text(), "Catalog credential leaked into the saved snapshot"
                     artifact("provider-result")
                     key("/")
                     expect("Search commands")
@@ -269,6 +316,19 @@ def main():
                     assert len(requests) == 2
                     assert len(list(live_store.iterdir())) == 1, "Continuation created a duplicate session"
                     assert "Local fixture response" in json.dumps(requests[1]), "Saved history was not sent on resume"
+                    key("q")
+                    expect_exit()
+                    # Reload the saved, dynamically sourced connection in a
+                    # fresh process and resume without selecting it again.
+                    launch("dark", live_store, catalog_url=f"http://127.0.0.1:{provider.server_port}/catalog.json")
+                    key("Down", "Down", "Enter")
+                    expect("1 saved sessions")
+                    key("Enter")
+                    expect("Session and journal consistency checks passed")
+                    key("Enter", "3", "s")
+                    expect("Complete / snapshot saved")
+                    assert len(requests) == 3
+                    assert "catalog-fixture-secret-value" not in snapshot.read_text()
                     key("q")
                     expect_exit()
                 finally:

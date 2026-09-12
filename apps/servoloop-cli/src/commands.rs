@@ -11,6 +11,18 @@ pub(crate) fn provider(name: &str, base: Option<String>) -> Result<ProviderSpec,
     Ok(base.map_or(p.clone(), |u| p.with_base_url(u)))
 }
 
+pub(crate) fn configured_provider(
+    name: &str,
+    base: Option<String>,
+    cfg: &Config,
+) -> Result<ProviderSpec, String> {
+    if let Some(profile) = cfg.provider_profile.as_ref().filter(|p| p.id == name) {
+        profile.spec(base)
+    } else {
+        provider(name, base)
+    }
+}
+
 pub(crate) fn setting(
     args: &[String],
     flag: &str,
@@ -31,7 +43,7 @@ pub(crate) async fn models(args: &[String], cfg: &Config) -> Result<i32, String>
     )
     .ok_or("--provider is required")?;
     let model = setting(args, "--model", "SERVOLOOP_MODEL", cfg.model.clone());
-    let spec = provider(
+    let spec = configured_provider(
         &name,
         setting(
             args,
@@ -39,6 +51,7 @@ pub(crate) async fn models(args: &[String], cfg: &Config) -> Result<i32, String>
             "SERVOLOOP_BASE_URL",
             cfg.base_url.clone(),
         ),
+        cfg,
     )?;
     let opts = DiscoveryOptions {
         explicit_model_ids: model.into_iter().collect(),
