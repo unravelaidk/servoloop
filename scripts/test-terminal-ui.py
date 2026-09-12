@@ -83,7 +83,7 @@ def main():
                 tmux("new-session", "-d", "-s", "ui", "-x", "120", "-y", "34", shell)
             else:
                 tmux("respawn-pane", "-k", "-t", "ui:0.0", shell)
-            expect("Your first verified movement.")
+            expect("Start with a simulated arm.")
 
         def expect_exit():
             deadline = time.monotonic() + 10
@@ -145,7 +145,7 @@ def main():
             key("n")
             expect("Review the offline demo")
             key("Escape")
-            expect("Your first verified movement.")
+            expect("Start with a simulated arm.")
             assert len(list(store.iterdir())) == 1, "Navigation replayed motion"
             tmux("resize-window", "-t", "ui:0", "-x", "40", "-y", "12")
             expect("Enlarge to at least")

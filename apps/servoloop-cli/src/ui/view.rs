@@ -3,10 +3,10 @@ use super::{
     Screen,
 };
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
     Frame,
 };
 
@@ -19,6 +19,7 @@ pub(super) struct Theme {
     positive: Color,
     warning: Color,
     line: Color,
+    selected: Color,
 }
 
 impl Theme {
@@ -32,6 +33,7 @@ impl Theme {
                 positive: Color::Rgb(24, 105, 72),
                 warning: Color::Rgb(133, 65, 11),
                 line: Color::Rgb(178, 185, 196),
+                selected: Color::Rgb(228, 232, 242),
             },
             "mono" => Self {
                 bg: Color::Reset,
@@ -41,15 +43,17 @@ impl Theme {
                 positive: Color::Reset,
                 warning: Color::Reset,
                 line: Color::Reset,
+                selected: Color::Reset,
             },
             _ => Self {
-                bg: Color::Rgb(20, 23, 29),
-                fg: Color::Rgb(232, 236, 242),
-                muted: Color::Rgb(163, 174, 192),
-                accent: Color::Rgb(149, 185, 255),
+                bg: Color::Rgb(32, 32, 32),
+                fg: Color::Rgb(235, 235, 235),
+                muted: Color::Rgb(173, 173, 173),
+                accent: Color::Rgb(177, 190, 255),
                 positive: Color::Rgb(134, 210, 166),
                 warning: Color::Rgb(243, 193, 123),
-                line: Color::Rgb(63, 73, 88),
+                line: Color::Rgb(69, 69, 69),
+                selected: Color::Rgb(43, 43, 43),
             },
         }
     }
@@ -94,45 +98,59 @@ pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
         );
         return view.scroll;
     }
-    let margin = if area.width < 72 { 1 } else { 3 };
-    let content = Rect::new(
-        area.x + margin,
-        area.y,
-        area.width - margin * 2,
-        area.height,
-    );
+    let shell = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.text().fg(theme.line));
+    let content = shell.inner(area);
+    frame.render_widget(shell, area);
+    let compact = area.height < 24;
     let [header, main, footer] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(if compact { 2 } else { 3 }),
         Constraint::Min(1),
         Constraint::Length(3),
     ])
     .areas(content);
 
-    let brand = Line::from(vec![
-        Span::styled("servoloop", theme.title()),
-        Span::styled(
-            if area.width >= 72 {
-                "  /  local workspace"
-            } else {
-                ""
-            },
-            theme.subdued(),
-        ),
-        Span::styled("  [SIMULATION ONLY]", theme.accent()),
-    ]);
+    let header_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .padding(Padding::horizontal(1))
+        .border_style(theme.text().fg(theme.line));
+    let header_content = header_block.inner(header);
+    frame.render_widget(header_block, header);
+    let [brand_area, context_area, mode_area] = Layout::horizontal([
+        Constraint::Length(19),
+        Constraint::Min(0),
+        Constraint::Length(19),
+    ])
+    .areas(header_content);
     frame.render_widget(
-        Paragraph::new(brand).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(theme.subdued()),
-        ),
-        header,
+        Paragraph::new(Line::from(vec![
+            Span::styled("[↻] ", theme.accent()),
+            Span::styled("servoloop", theme.title()),
+        ])),
+        brand_area,
     );
+    if area.width >= 72 {
+        frame.render_widget(
+            Paragraph::new("local workspace")
+                .alignment(Alignment::Center)
+                .style(theme.subdued()),
+            context_area,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("● SIMULATION ONLY")
+            .alignment(Alignment::Right)
+            .style(theme.text().fg(theme.positive)),
+        mode_area,
+    );
+    let margin = if area.width < 72 { 1 } else { 3 };
     let main = Rect::new(
-        main.x,
-        main.y + 1,
-        main.width,
-        main.height.saturating_sub(1),
+        main.x + margin,
+        main.y + u16::from(!compact),
+        main.width.saturating_sub(margin * 2),
+        main.height.saturating_sub(u16::from(!compact)),
     );
     let rendered_scroll = match view.screen {
         Screen::Welcome => welcome(frame, main, view),
@@ -178,6 +196,7 @@ pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
         .block(
             Block::default()
                 .borders(Borders::TOP)
+                .padding(Padding::horizontal(1))
                 .border_style(theme.text().fg(theme.line)),
         ),
         footer,
@@ -187,41 +206,160 @@ pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
 
 fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
-    let choices = ["Try the offline demo", "CLI reference & controls"];
-    let mut lines = vec![
-        Line::styled("Your first verified movement.", t.title()),
-        Line::from(""),
-        Line::from("Observe a simulated arm, make one bounded move,"),
-        Line::from("then inspect the evidence. No account or network needed."),
-        Line::from(""),
-    ];
-    for (index, choice) in choices.iter().enumerate() {
-        lines.push(Line::styled(
-            format!(
-                "{} {choice}",
-                if index == view.selected { ">" } else { " " }
-            ),
-            if index == view.selected {
-                t.accent()
-            } else {
-                t.subdued()
-            },
-        ));
-        lines.push(Line::from(""));
+    // Compact terminals retain all actions, without hiding a clipped menu.
+    if area.height < 15 {
+        return paragraph(
+            frame,
+            area,
+            vec![
+                Line::styled("Start with a simulated arm.", t.title()),
+                Line::styled(
+                    "No physical hardware is connected.",
+                    t.text().fg(t.positive),
+                ),
+                Line::from(""),
+                Line::styled(
+                    format!(
+                        "{} Try the offline demo",
+                        if view.selected == 0 { ">" } else { " " }
+                    ),
+                    if view.selected == 0 {
+                        t.accent()
+                    } else {
+                        t.text()
+                    },
+                ),
+                Line::styled("  Scripted provider / no network needed", t.subdued()),
+                Line::styled(
+                    format!(
+                        "{} CLI reference & controls",
+                        if view.selected == 1 { ">" } else { " " }
+                    ),
+                    if view.selected == 1 {
+                        t.accent()
+                    } else {
+                        t.text()
+                    },
+                ),
+                Line::from(""),
+                Line::styled(
+                    "Enter opens your selection; r confirms a demo.",
+                    t.subdued(),
+                ),
+            ],
+            0,
+            t,
+        );
     }
-    lines.push(Line::styled(
-        "Fixed script / fresh simulator / local journal",
-        t.subdued(),
-    ));
-    lines.push(Line::styled(
-        "No physical robot or Isaac Sim is connected.",
-        t.subdued(),
-    ));
-    paragraph(frame, area, lines, 0, t)
+    let [intro, menu, button, note] = Layout::vertical([
+        Constraint::Length(if area.height >= 17 { 6 } else { 5 }),
+        Constraint::Length(7),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .areas(area);
+    let lines = vec![
+        Line::styled("Start with a simulated arm.", t.title()),
+        Line::from(""),
+        Line::styled(
+            if area.width >= 70 {
+                "Describe a task, inspect execution, and verify the result."
+            } else {
+                "Inspect execution and verify the result."
+            },
+            t.subdued(),
+        ),
+        Line::from(""),
+        Line::styled(
+            "No physical hardware is connected.",
+            t.text().fg(t.positive),
+        ),
+    ];
+    paragraph(frame, intro, lines, 0, t);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .split(menu);
+    for (index, (title, detail)) in [
+        (
+            "Try the offline demo",
+            "Scripted provider · no account or network needed",
+        ),
+        (
+            "CLI reference & controls",
+            "Provider and saved-session commands · keyboard help",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selected = index == view.selected;
+        let bg = if selected { t.selected } else { t.bg };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    format!("{}  {title}", if selected { "›" } else { " " }),
+                    if selected {
+                        t.accent().bg(bg)
+                    } else {
+                        t.text().bg(bg)
+                    },
+                ),
+                Line::styled(format!("   {detail}"), t.subdued().bg(bg)),
+            ])
+            .style(t.text().bg(bg))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(t.text().fg(t.line))
+                    .padding(Padding::horizontal(1)),
+            ),
+            rows[index],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if view.selected == 0 {
+                    " Review offline demo ↵ "
+                } else {
+                    " Open CLI reference ↵ "
+                },
+                if t.bg == Color::Reset {
+                    t.text().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(t.bg)
+                        .bg(t.fg)
+                        .add_modifier(Modifier::BOLD)
+                },
+            ),
+            Span::styled("   ↑ ↓ choose · Enter open", t.subdued()),
+        ])),
+        button,
+    );
+    paragraph(
+        frame,
+        note,
+        vec![Line::styled(
+            if area.width >= 70 {
+                "Fixed offline script · no physical robot or Isaac Sim connected."
+            } else {
+                "Fixed script · no hardware or Isaac Sim."
+            },
+            t.subdued(),
+        )],
+        0,
+        t,
+    );
+    0
 }
 
 fn review(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
+    let area = panel(frame, area, " Offline demo / review before running ", t);
     paragraph(
         frame,
         area,
@@ -255,6 +393,7 @@ fn activity(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
         ])
         .areas(area);
         let scroll = transcript(frame, timeline, view);
+        let facts = panel(frame, facts, " Result / evidence ", t);
         paragraph(frame, facts, evidence(view.report, t), 0, t);
         scroll
     } else {
@@ -264,6 +403,7 @@ fn activity(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
 
 fn transcript(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
+    let area = panel(frame, area, " Offline demo / execution ", t);
     let report = view.report;
     let heading = if report.phase.active() {
         format!("Offline shoulder check / {}s", view.elapsed)
@@ -348,10 +488,8 @@ fn evidence(report: &Report, t: Theme) -> Vec<Line<'static>> {
         Line::from(""),
         Line::styled("Initial observation", t.subdued()),
         Line::from(position(report.initial)),
-        Line::from(""),
         Line::styled("Verified post-action position", t.subdued()),
         Line::from(position(report.verified)),
-        Line::from(""),
         Line::styled("Persistence", t.subdued()),
         Line::from(if report.journal_recorded {
             "Verified result journaled"
@@ -368,9 +506,8 @@ fn evidence(report: &Report, t: Theme) -> Vec<Line<'static>> {
 
 fn inspect(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
-    let mut lines = evidence(view.report, t);
-    lines.extend([
-        Line::from(""),
+    let area = panel(frame, area, " Run inspector ", t);
+    let mut lines = vec![
         Line::styled("Session / durable record", t.title()),
         Line::from(
             view.report
@@ -379,6 +516,10 @@ fn inspect(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
                 .unwrap_or_else(|| "not opened".into()),
         ),
         Line::from(format!("Store: {}", view.report.store)),
+        Line::from(""),
+    ];
+    lines.extend(evidence(view.report, t));
+    lines.extend([
         Line::from(""),
         Line::from("Inspect from another terminal with the same store:"),
         Line::styled(
@@ -400,6 +541,7 @@ fn inspect(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
 
 fn help(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
+    let area = panel(frame, area, " CLI reference & controls ", t);
     paragraph(
         frame,
         area,
@@ -430,6 +572,22 @@ fn help(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
         view.scroll,
         t,
     )
+}
+
+fn panel(frame: &mut Frame, area: Rect, title: &'static str, theme: Theme) -> Rect {
+    // Borders cost precious rows on small terminals. Keep the same hierarchy
+    // there using text rather than reducing the readable viewport further.
+    if area.height < 16 {
+        return area;
+    }
+    let block = Block::default()
+        .title(Line::styled(title, theme.subdued()))
+        .borders(Borders::ALL)
+        .border_style(theme.text().fg(theme.line))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 fn paragraph(
@@ -486,6 +644,47 @@ mod tests {
                     (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
                 assert!(ratio >= 4.5, "{name} {role:?}: {ratio}");
             }
+            let background = luminance(theme.selected);
+            for role in [theme.fg, theme.muted, theme.accent] {
+                let foreground = luminance(role);
+                let ratio =
+                    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+                assert!(ratio >= 4.5, "{name} selected {role:?}: {ratio}");
+            }
+        }
+    }
+
+    #[test]
+    fn paper_welcome_retains_selected_row_and_action_at_standard_size() {
+        for selected in [0, 1] {
+            let theme = Theme::named("dark");
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        &View {
+                            screen: Screen::Welcome,
+                            selected,
+                            report: &Report::default(),
+                            theme,
+                            scroll: 0,
+                            elapsed: 0,
+                        },
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("Start with a simulated arm."));
+            assert!(text.contains("Try the offline demo"));
+            assert!(text.contains("CLI reference & controls"));
+            assert!(text.contains(if selected == 0 {
+                "Review offline demo"
+            } else {
+                "Open CLI reference"
+            }));
+            assert!(buffer.content.iter().any(|cell| cell.bg == theme.selected));
         }
     }
 

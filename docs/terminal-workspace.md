@@ -8,6 +8,8 @@ commands retain their interfaces and output formats.
 These previews are rasterized from actual tmux ANSI captures of the passing
 offline-demo smoke test. Font appearance depends on your terminal emulator.
 
+![Welcome with charcoal workspace, highlighted offline-demo row, and review action](images/terminal-workspace-welcome.png)
+
 ![Wide terminal showing the verified shoulder position, saved snapshot, activity, and evidence column](images/terminal-workspace.png)
 
 ![Narrow terminal showing the same verified result and activity in one column](images/terminal-workspace-narrow.png)
@@ -26,7 +28,14 @@ free-form conversation, saved-session navigation, and updates remain later
 work, not disabled controls masquerading as implemented features.
 
 The working context is a developer using a local terminal alongside code and
-logs. The design preserves the board's restrained dark/blue direction, while
+logs. Following the user's visual-fidelity feedback, the UI uses the Paper
+board's charcoal background (`#202020`), selected-row fill (`#2b2b2b`), and
+neutral borders (`#454545`). It restores the framed workspace, centered header
+context, green simulation indicator, lavender-blue selection, and contrasting
+primary action. Smaller terminals compress spacing and omit interior panel
+borders to preserve readable content and keyboard controls.
+
+The implementation also supports other viewing conditions,
 providing a light palette for bright environments and monochrome output for
 user-controlled terminal colors. No user research or real simulator validation
 is claimed.
@@ -45,7 +54,7 @@ more decoration.
 | P1 | The running mockup shows independent validation, intent, and dispatch stages that are not independently emitted by the current runtime. | Render only observed runtime events. A command-tool start does not prove dispatch. |
 | P1 | The existing top-level `verified` NDJSON event is emitted on model completion, not exclusively on verified motion. | The UI ignores that envelope as physical evidence. It requires an accepted command with a finite, target-matching post-action observation. The legacy stream is unchanged for compatibility. |
 | P1 | Back and cancellation shortcuts recur across the mockups without terminal-level interaction proof. | Escape changes views only. Ctrl+C requests cancellation and remains available while inspecting; quitting waits for cleanup. |
-| P2 | Repeated headers, footers, notices, and bordered blocks compete with the actual run evidence. | Use one persistent context header, one status/shortcut footer, a transcript, and an on-demand inspector. Wide activity views add a compact evidence column. |
+| P2 | Repeated headers and notices can compete with run evidence in smaller terminals. | Preserve Paper's framed visual language with one persistent header and footer; compact the interior when space is limited. Wide activity views add an evidence column. |
 | P2 | Setup, update, and recovery states imply capabilities beyond the first runnable CLI slice. | Keep them in the design backlog. Do not ship fake network checks, updates, or reconciliation controls. |
 | P2 | A narrow visual mockup does not establish terminal resize, paste, or input behavior. | Add rendered-buffer tests and a real PTY test, including resizing while the app is open and refusing hidden motion shortcuts. |
 
