@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def main():
@@ -66,13 +68,15 @@ def main():
                     tmux("capture-pane", "-p", "-e", "-t", "ui:0.0")
                 )
 
-        def launch(theme, store, first=False, no_color=False):
+        def launch(theme, store, first=False, no_color=False, catalog_url="http://127.0.0.1:9/catalog.json"):
             exit_status.unlink(missing_ok=True)
             command = shlex.join([
                 str(binary), "ui", "--theme", theme,
                 "--store", str(store), "--config", str(config),
             ])
-            environment = "export NO_COLOR=1; " if no_color else "unset NO_COLOR; "
+            environment = "unset SERVOLOOP_PROVIDER SERVOLOOP_MODEL SERVOLOOP_BASE_URL; "
+            environment += "export SERVOLOOP_MODELS_DEV_URL=" + shlex.quote(catalog_url) + "; "
+            environment += "export NO_COLOR=1; " if no_color else "unset NO_COLOR; "
             shell = (
                 environment + "before=$(stty -g); " + command + "; result=$?; "
                 'after=$(stty -g); if [ "$before" = "$after" ]; then restored=yes; '
@@ -166,6 +170,110 @@ def main():
             key("C-c")
             expect_exit()
             assert not (root / "no-color").exists()
+
+            # Real setup, discovery, send and resume against a loopback fixture.
+            # No provider credentials or external service are used.
+            requests = []
+            class ProviderFixture(BaseHTTPRequestHandler):
+                def log_message(self, *unused):
+                    pass
+
+                def reply(self, value):
+                    body = json.dumps(value).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def do_GET(self):
+                    if self.path == "/catalog.json":
+                        self.reply({"ollama": {"name": "Ollama", "models": {
+                            "fixture-model": {"name": "Fixture", "tool_call": True, "limit": {"context": 8192}},
+                            "catalog-only-model": {"name": "Catalog only", "tool_call": False}
+                        }}})
+                    else:
+                        self.reply({"data": [{"id": "fixture-model"}], "models": [{"name": "fixture-model"}]})
+
+                def do_POST(self):
+                    request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    requests.append(request)
+                    self.reply({"choices": [{"message": {"content": "Local fixture response. No robot tools requested."}, "finish_reason": "stop"}]})
+
+            with ThreadingHTTPServer(("127.0.0.1", 0), ProviderFixture) as provider:
+                thread = threading.Thread(target=provider.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    config.write_text(json.dumps({"version": 1, "provider": "ollama", "model": "fixture-model",
+                        "base_url": f"http://127.0.0.1:{provider.server_port}/v1"}))
+                    tmux("resize-window", "-t", "ui:0", "-x", "120", "-y", "34")
+                    live_store = root / "provider-store"
+                    launch("dark", live_store, catalog_url=f"http://127.0.0.1:{provider.server_port}/catalog.json")
+                    key("Down", "Enter")
+                    expect("Pending changes apply to the next run")
+                    artifact("provider-setup")
+                    key("Enter")
+                    expect("Choose a provider")
+                    artifact("provider-picker-all")
+                    key("q")
+                    expect("No matching provider")
+                    key("BSpace", "ollama")
+                    expect("1 matches")
+                    artifact("provider-picker")
+                    key("Escape")
+                    expect("Selection cancelled")
+                    key("Tab", "Tab", "Tab", "Enter")
+                    expect("Endpoint returned 1 models")
+                    expect("Choose a model")
+                    expect("catalog-only-model")
+                    artifact("model-picker-all")
+                    key("fixture-model")
+                    expect("1 matches")
+                    expect("Tools: supported")
+                    artifact("provider-models")
+                    assert requests == [], "Discovery dispatched a model request"
+                    key("Enter")
+                    expect("Model selected")
+                    key("Tab", "Enter")
+                    expect("What would you like to test?")
+                    assert json.loads(config.read_text())["model"] == "fixture-model"
+                    key("1")
+                    expect("Inspect the current joint positions")
+                    key("/")
+                    expect("Search commands")
+                    artifact("command-palette")
+                    key("Escape")
+                    expect("What would you like to test?")
+                    assert requests == [], "Navigation or suggestion submitted a request"
+                    artifact("conversation-draft")
+                    key("s")
+                    expect("Complete / snapshot saved")
+                    expect("Local fixture response")
+                    assert len(requests) == 1
+                    assert "Position verified:" not in capture(), "Model prose became physical verification"
+                    artifact("provider-result")
+                    key("/")
+                    expect("Search commands")
+                    key("Down", "Enter")
+                    expect("1 saved sessions")
+                    artifact("session-browser")
+                    key("Enter")
+                    expect("Session and journal consistency checks passed")
+                    artifact("resume-preflight")
+                    assert len(requests) == 1, "Preflight contacted the model"
+                    key("Enter")
+                    expect("Resumed conversation")
+                    artifact("resumed-conversation")
+                    key("3", "s")
+                    expect("Complete / snapshot saved")
+                    assert len(requests) == 2
+                    assert len(list(live_store.iterdir())) == 1, "Continuation created a duplicate session"
+                    assert "Local fixture response" in json.dumps(requests[1]), "Saved history was not sent on resume"
+                    key("q")
+                    expect_exit()
+                finally:
+                    provider.shutdown()
+                    thread.join(timeout=5)
 
             bad_store = root / "not-a-directory"
             bad_store.write_text("preserve this file")

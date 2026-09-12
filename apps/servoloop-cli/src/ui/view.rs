@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
     Frame,
 };
 
@@ -81,7 +81,16 @@ pub(super) struct View<'a> {
     pub(super) elapsed: u64,
 }
 
+#[cfg(test)]
 pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
+    draw_workspace(frame, view, None)
+}
+
+pub(super) fn draw_workspace(
+    frame: &mut Frame,
+    view: &View<'_>,
+    workspace: Option<&super::workspace::Workspace>,
+) -> usize {
     let theme = view.theme;
     let area = frame.area();
     frame.render_widget(Block::default().style(theme.text()), area);
@@ -158,8 +167,12 @@ pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
         Screen::Activity => activity(frame, main, view),
         Screen::Inspect => inspect(frame, main, view),
         Screen::Help => help(frame, main, view),
+        Screen::Workspace => workspace
+            .map(|workspace| workspace_view(frame, main, view, workspace))
+            .unwrap_or(0),
     };
     let actions = match view.screen {
+        Screen::Workspace => workspace.map(workspace_keys).unwrap_or("Esc back  q quit"),
         Screen::Welcome => "Up/Down choose  Enter open  ? help  q quit",
         Screen::Review => "r run demo   Esc back   ? help   q quit",
         Screen::Help if view.report.phase.active() => {
@@ -174,11 +187,14 @@ pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
             "i inspect   Up/Down scroll   Ctrl+C cancel run"
         }
         Screen::Activity if view.report.phase == Phase::Complete => {
-            "i inspect   n new demo   Up/Down scroll   q quit"
+            "i inspect  n new demo  c continue  q quit"
         }
         Screen::Activity => "i inspect   Up/Down scroll   q quit",
     };
     let label = match view.screen {
+        Screen::Workspace if workspace.is_some_and(|w| !w.status.is_empty()) => {
+            workspace.expect("workspace status").status.as_str()
+        }
         Screen::Welcome | Screen::Review if !view.report.phase.active() => {
             "Nothing runs until you confirm the demo."
         }
@@ -201,13 +217,16 @@ pub(super) fn draw(frame: &mut Frame, view: &View<'_>) -> usize {
         ),
         footer,
     );
+    if let Some(workspace) = workspace.filter(|w| w.picker.is_some()) {
+        picker_popup(frame, workspace, theme);
+    }
     rendered_scroll
 }
 
 fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
     // Compact terminals retain all actions, without hiding a clipped menu.
-    if area.height < 15 {
+    if area.height < 18 {
         return paragraph(
             frame,
             area,
@@ -232,10 +251,21 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
                 Line::styled("  Scripted provider / no network needed", t.subdued()),
                 Line::styled(
                     format!(
-                        "{} CLI reference & controls",
+                        "{} Configure a provider",
                         if view.selected == 1 { ">" } else { " " }
                     ),
                     if view.selected == 1 {
+                        t.accent()
+                    } else {
+                        t.text()
+                    },
+                ),
+                Line::styled(
+                    format!(
+                        "{} Open a saved session",
+                        if view.selected == 2 { ">" } else { " " }
+                    ),
+                    if view.selected == 2 {
                         t.accent()
                     } else {
                         t.text()
@@ -253,7 +283,7 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     }
     let [intro, menu, button, note] = Layout::vertical([
         Constraint::Length(if area.height >= 17 { 6 } else { 5 }),
-        Constraint::Length(7),
+        Constraint::Length(10),
         Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
         Constraint::Min(1),
     ])
@@ -279,6 +309,7 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
+        Constraint::Length(3),
         Constraint::Min(0),
     ])
     .split(menu);
@@ -287,9 +318,10 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
             "Try the offline demo",
             "Scripted provider · no account or network needed",
         ),
+        ("Configure a provider", "Use an OpenAI-compatible endpoint"),
         (
-            "CLI reference & controls",
-            "Provider and saved-session commands · keyboard help",
+            "Open a saved session",
+            "Restore conversation history, not robot state",
         ),
     ]
     .into_iter()
@@ -324,8 +356,10 @@ fn welcome(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
         button,
         if view.selected == 0 {
             "Review offline demo ↵"
+        } else if view.selected == 1 {
+            "Configure a provider ↵"
         } else {
-            "Open CLI reference ↵"
+            "Open a saved session ↵"
         },
         "↑ ↓ choose · Enter open",
         t,
@@ -450,16 +484,34 @@ fn activity(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
 
 fn transcript(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
     let t = view.theme;
-    let area = panel(frame, area, " Offline demo / execution ", t);
+    let area = panel(
+        frame,
+        area,
+        if view.report.demo {
+            " Offline demo / execution "
+        } else {
+            " Conversation / execution "
+        },
+        t,
+    );
     let report = view.report;
-    let heading = if report.phase.active() {
-        format!("Offline shoulder check / {}s", view.elapsed)
+    let name = if report.demo {
+        "Offline shoulder check"
     } else {
-        "Offline shoulder check".into()
+        "Provider conversation / simulated arm"
+    };
+    let heading = if report.phase.active() {
+        format!("{name} / {}s", view.elapsed)
+    } else {
+        name.into()
     };
     let mut lines = vec![Line::styled(heading, t.title()), Line::from("")];
     let summary = match report.verified {
         Some(value) => format!("+ Position verified: {value:.3} rad"),
+        None if report.post_observed.is_some() => format!(
+            "Post-action shoulder observed: {:.3} rad. Inspect command evidence.",
+            report.post_observed.unwrap()
+        ),
         None if report.command_started => {
             "! Position not verified. Inspect the recorded outcome.".into()
         }
@@ -491,6 +543,14 @@ fn transcript(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
         lines.push(Line::styled(format!("! {error}"), t.text().fg(t.warning)));
     }
     lines.push(Line::from(""));
+    if !report.answer.is_empty() {
+        lines.push(Line::styled(
+            "ServoLoop / model response (bounded preview)",
+            t.subdued(),
+        ));
+        lines.push(Line::from(report.answer.clone()));
+        lines.push(Line::from(""));
+    }
     if !report.activity.is_empty() {
         lines.push(Line::styled(
             "Activity / recorded runtime events",
@@ -531,12 +591,27 @@ fn evidence(report: &Report, t: Theme) -> Vec<Line<'static>> {
         Line::styled("Execution evidence", t.title()),
         Line::from(""),
         Line::styled("Requested target", t.subdued()),
-        Line::from("shoulder / 0.200 rad"),
+        Line::from(if report.demo {
+            "shoulder / 0.200 rad"
+        } else {
+            "See submitted request / tool records"
+        }),
         Line::from(""),
         Line::styled("Initial observation", t.subdued()),
         Line::from(position(report.initial)),
-        Line::styled("Verified post-action position", t.subdued()),
-        Line::from(position(report.verified)),
+        Line::styled(
+            if report.demo {
+                "Verified post-action position"
+            } else {
+                "Observed post-action position"
+            },
+            t.subdued(),
+        ),
+        Line::from(position(if report.demo {
+            report.verified
+        } else {
+            report.post_observed
+        })),
         Line::styled("Persistence", t.subdued()),
         Line::from(if report.journal_recorded {
             "Verified result journaled"
@@ -608,8 +683,11 @@ fn help(frame: &mut Frame, area: Rect, view: &View<'_>) -> usize {
             Line::from("servoloop sessions list"),
             Line::from("servoloop config --help"),
             Line::from(""),
-            Line::from("The demo does not accept arbitrary prompts. Provider setup,"),
-            Line::from("resume, and updates are not implemented in this UI slice."),
+            Line::from("The offline demo is fixed. Configure a provider for free-form prompts."),
+            Line::from("/ opens commands. m opens model selection from a conversation."),
+            Line::from("Pickers: type to search, arrows to choose, Enter select, Esc cancel."),
+            Line::from("Conversations: e edits, Enter finishes editing, s sends."),
+            Line::from("Saved-session preflight never replays commands. Updates are manual."),
             Line::from("Existing run/resume commands retain their NDJSON output."),
             Line::from(""),
             Line::styled("Appearance", t.title()),
@@ -637,6 +715,482 @@ fn panel(frame: &mut Frame, area: Rect, title: &'static str, theme: Theme) -> Re
     inner
 }
 
+fn picker_popup(frame: &mut Frame, workspace: &super::workspace::Workspace, theme: Theme) {
+    use super::{state::safe_text, workspace::PickerKind};
+    let picker = workspace.picker.as_ref().expect("picker is open");
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(88);
+    let height = screen
+        .height
+        .saturating_sub(2)
+        .min(if picker.kind == PickerKind::Provider {
+            15
+        } else {
+            21
+        });
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let title = if picker.kind == PickerKind::Provider {
+        " Choose a provider "
+    } else {
+        " Choose a model "
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Line::styled(title, theme.title()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.text().fg(theme.accent))
+        .style(theme.text())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [search, list, details, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(2),
+        Constraint::Length(4),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(format!("› {}▏", safe_text(&picker.query)), theme.accent()),
+            Line::styled(
+                if picker.kind == PickerKind::Provider {
+                    "Search supported providers · no connection on selection".into()
+                } else {
+                    format!(
+                        "{} · Models.dev + endpoint discovery",
+                        safe_text(&workspace.provider)
+                    )
+                },
+                theme.subdued(),
+            ),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(theme.text().fg(theme.line)),
+        ),
+        search,
+    );
+    let choices = workspace.choices(picker);
+    let start = picker
+        .selected
+        .saturating_sub(usize::from(list.height.saturating_sub(1)));
+    for (index, choice) in choices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(usize::from(list.height))
+    {
+        let selected = index == picker.selected;
+        let label = format!(
+            "{} {}",
+            if selected { "›" } else { " " },
+            safe_text(&choice.title)
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(if selected {
+                theme.accent().bg(theme.selected)
+            } else {
+                theme.text()
+            }),
+            Rect::new(list.x, list.y + (index - start) as u16, list.width, 1),
+        );
+    }
+    if choices.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if workspace.busy() {
+                "Loading model catalog… You can type a custom ID now."
+            } else if picker.kind == PickerKind::Model {
+                "No models found. Type an exact ID to add a custom model."
+            } else {
+                "No matching provider. Try OpenAI, OpenRouter, NVIDIA, or Ollama."
+            })
+            .wrap(Wrap { trim: false })
+            .style(theme.subdued()),
+            list,
+        );
+    }
+    let mut detail = vec![];
+    if let Some(choice) = choices.get(picker.selected) {
+        detail.push(Line::styled(safe_text(&choice.detail), theme.subdued()));
+    }
+    if picker.kind == PickerKind::Model && workspace.busy() {
+        detail.push(Line::styled(
+            "Loading… Selection does not send a prompt.",
+            theme.subdued(),
+        ));
+    } else if !workspace.status.is_empty() {
+        detail.push(Line::styled(safe_text(&workspace.status), theme.subdued()));
+    }
+    frame.render_widget(
+        Paragraph::new(detail).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme.text().fg(theme.line)),
+        ),
+        details,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                if width >= 70 && picker.kind == PickerKind::Model {
+                    "↑ ↓ navigate   Enter select   Esc cancel   F5 refresh"
+                } else {
+                    "↑ ↓ choose  Enter select  Esc cancel"
+                },
+                theme.text(),
+            ),
+            Line::styled(
+                format!("{} matches · pending until Save", choices.len()),
+                theme.subdued(),
+            ),
+        ]),
+        footer,
+    );
+}
+
+fn workspace_keys(workspace: &super::workspace::Workspace) -> &'static str {
+    use super::workspace::Page;
+    if workspace.picker.is_some() {
+        return "Type to search  ↑ ↓ choose  Enter select  Esc cancel";
+    }
+    if workspace.editing {
+        return "Type to edit  Enter done  Esc done  Ctrl+C cancel";
+    }
+    match workspace.page {
+        Page::Setup => "Tab choose  Enter edit/open  Esc back  q quit",
+        Page::Sessions => "e search  r refresh  Enter review  Esc back  q quit",
+        Page::Preflight => "Enter resume  Esc sessions  PgDn scroll  q quit",
+        Page::Conversation => "e compose  s send  m models  / commands  q quit",
+        Page::Palette => "e search  Up/Down choose  Enter open  Esc back",
+        Page::Updates => "Esc back  / commands  q quit",
+    }
+}
+
+fn workspace_view(
+    frame: &mut Frame,
+    area: Rect,
+    view: &View<'_>,
+    workspace: &super::workspace::Workspace,
+) -> usize {
+    use super::{state::safe_text, workspace::Page};
+    let t = view.theme;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let title = match workspace.page {
+        Page::Setup => "Configure a provider",
+        Page::Sessions => "Saved sessions",
+        Page::Preflight => "Resume preflight",
+        Page::Conversation => {
+            if workspace.session.is_some() {
+                "Resumed conversation"
+            } else {
+                "What would you like to test?"
+            }
+        }
+        Page::Palette => "Commands",
+        Page::Updates => "Update ServoLoop",
+    };
+    lines.extend([Line::styled(title, t.title()), Line::from("")]);
+    let selected = |index: usize, label: String| {
+        Line::styled(
+            format!(
+                "{} {label}",
+                if index == workspace.selected {
+                    "›"
+                } else {
+                    " "
+                }
+            ),
+            if index == workspace.selected {
+                t.accent().bg(t.selected)
+            } else {
+                t.text()
+            },
+        )
+    };
+    match workspace.page {
+        Page::Setup => {
+            lines.push(Line::styled(
+                "Pending changes apply to the next run only.",
+                t.subdued(),
+            ));
+            lines.push(Line::from(""));
+            let source = match workspace.provider.as_str() {
+                "openrouter" => "OPENROUTER_API_KEY",
+                "nvidia" => "NVIDIA_API_KEY",
+                "ollama" => "No credential required",
+                _ => "OPENAI_API_KEY",
+            };
+            for (index, (label, value)) in [
+                ("Provider  /  Enter to choose", workspace.provider.as_str()),
+                (
+                    "Endpoint",
+                    if workspace.endpoint.is_empty() {
+                        "Provider default"
+                    } else {
+                        &workspace.endpoint
+                    },
+                ),
+                (
+                    "Model ID",
+                    if workspace.model.is_empty() {
+                        "Enter exact model ID"
+                    } else {
+                        &workspace.model
+                    },
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                lines.push(Line::styled(label, t.subdued()));
+                lines.push(Line::styled(
+                    format!(
+                        "{} {}{}",
+                        if workspace.field == index { "›" } else { " " },
+                        safe_text(value),
+                        if workspace.editing && workspace.field == index {
+                            "▏"
+                        } else {
+                            ""
+                        }
+                    ),
+                    if workspace.field == index {
+                        t.accent().bg(t.selected)
+                    } else {
+                        t.text()
+                    },
+                ));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::styled(
+                format!("Credential source: {source} · value hidden"),
+                t.subdued(),
+            ));
+            lines.push(Line::from(""));
+            for (index, label) in [
+                (3, "Test connection / choose a model"),
+                (4, "Save and continue"),
+            ] {
+                lines.push(Line::styled(
+                    format!(
+                        "{} {label}",
+                        if workspace.field == index { "›" } else { " " }
+                    ),
+                    if workspace.field == index {
+                        t.accent().bg(t.selected)
+                    } else {
+                        t.text()
+                    },
+                ));
+            }
+            lines.push(Line::styled(
+                "Save applies settings. Escape discards unapplied edits.",
+                t.subdued(),
+            ));
+        }
+        Page::Sessions => {
+            lines.push(Line::from(
+                "Local history · review a session before resuming.",
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "Search: {}{}",
+                    safe_text(&workspace.query),
+                    if workspace.editing { "▏" } else { "" }
+                ),
+                t.accent(),
+            ));
+            lines.push(Line::from(""));
+            let sessions = workspace.filtered_sessions();
+            if sessions.is_empty() && !workspace.busy() {
+                lines.push(Line::from(
+                    "No matching saved sessions. An offline demo creates local history.",
+                ));
+            }
+            for (index, id) in sessions
+                .into_iter()
+                .enumerate()
+                .skip(workspace.selected.saturating_sub(4))
+                .take(9)
+            {
+                lines.push(selected(index, safe_text(id)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::styled("History is not robot state", t.title()));
+            lines.push(Line::from(
+                "Opening a saved session does not replay its commands.",
+            ));
+            lines.push(Line::styled("Review selected session ↵", t.accent()));
+        }
+        Page::Preflight => {
+            lines.push(Line::from(
+                "Restore the conversation. Observe the environment again.",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Saved conversation", t.title()));
+            lines.push(Line::from(
+                workspace
+                    .session
+                    .clone()
+                    .unwrap_or_else(|| "Not cleared for resume".into()),
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Fresh simulator", t.title()));
+            lines.push(Line::from(
+                "Driver: simulated-arm · shoulder now: not observed",
+            ));
+            lines.push(Line::from(
+                "Motion replay: disabled · no tools executed by preflight",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                if workspace.preflight_ok {
+                    "Resume conversation ↵"
+                } else {
+                    "Resume blocked until checks pass"
+                },
+                t.accent(),
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "Historical messages / not current robot state",
+                t.subdued(),
+            ));
+            lines.extend(workspace.history.iter().cloned().map(Line::from));
+        }
+        Page::Conversation => {
+            lines.push(Line::styled(
+                format!(
+                    "{} / {} · simulated-arm",
+                    safe_text(
+                        workspace
+                            .config
+                            .model
+                            .as_deref()
+                            .unwrap_or("No model selected")
+                    ),
+                    safe_text(
+                        workspace
+                            .config
+                            .provider
+                            .as_deref()
+                            .unwrap_or("No provider selected")
+                    )
+                ),
+                t.subdued(),
+            ));
+            if workspace.session.is_some() {
+                lines.push(Line::from(
+                    "The simulator is fresh. Previous movements have not been replayed.",
+                ));
+            } else {
+                lines.push(Line::from("A fresh session. No commands have been sent."));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Current execution context", t.title()));
+            lines.push(Line::from(
+                "Maximum shoulder step: 0.250 rad. Active policy checks motion.",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from("1  Inspect the current joint positions"));
+            lines.push(Line::from("2  Move the shoulder to 0.2 radians"));
+            lines.push(Line::from("3  Explain the execution limits"));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "› {}{}",
+                    if workspace.draft.is_empty() {
+                        "Describe a task…".into()
+                    } else {
+                        safe_text(&workspace.draft)
+                    },
+                    if workspace.editing { "▏" } else { "" }
+                ),
+                t.accent(),
+            ));
+            lines.push(Line::styled(
+                "[s] Send · suggestions only fill the draft",
+                t.accent(),
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "Earlier conversation / historical",
+                t.subdued(),
+            ));
+            lines.extend(workspace.history.iter().cloned().map(Line::from));
+        }
+        Page::Palette => {
+            lines.push(Line::styled(
+                format!(
+                    "Search commands: {}{}",
+                    safe_text(&workspace.query),
+                    if workspace.editing { "▏" } else { "" }
+                ),
+                t.subdued(),
+            ));
+            lines.push(Line::from(""));
+            for (index, (name, detail)) in workspace.palette().into_iter().enumerate() {
+                lines.push(selected(index, name.into()));
+                lines.push(Line::styled(format!("  {detail}"), t.subdued()));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(
+                "Escape closes the palette and keeps your draft.",
+            ));
+        }
+        Page::Updates => {
+            lines.push(Line::from(format!(
+                "Installed version: {}",
+                env!("CARGO_PKG_VERSION")
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Automatic update unavailable", t.title()));
+            lines.push(Line::from("Installation provenance has not been verified."));
+            lines.push(Line::from(
+                "Use the installation method you originally used.",
+            ));
+            lines.push(Line::from(
+                "https://github.com/unravelaidk/servoloop/releases",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Nothing checked or installed. No sudo, force, or silent updates.",
+            ));
+        }
+    }
+    if !workspace.status.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            safe_text(&workspace.status),
+            t.text().fg(t.warning),
+        ));
+    }
+    let focus_line: usize = match workspace.page {
+        Page::Setup => match workspace.field {
+            0 => 5,
+            1 => 8,
+            2 => 11,
+            3 => 16,
+            _ => 17,
+        },
+        _ => 0,
+    };
+    let scroll = view.scroll.max(
+        focus_line
+            .saturating_add(2)
+            .saturating_sub(usize::from(area.height)),
+    );
+    paragraph(frame, area, lines, scroll, t)
+}
+
 fn paragraph(
     frame: &mut Frame,
     area: Rect,
@@ -659,6 +1213,56 @@ fn paragraph(
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn picker_popup_renders_at_supported_sizes_and_all_themes() {
+        use super::super::workspace::{Page, Picker, PickerKind, Workspace};
+        for (width, height) in [(120, 34), (80, 24), (48, 18)] {
+            for theme in ["dark", "light", "mono"] {
+                for kind in [PickerKind::Provider, PickerKind::Model] {
+                    let mut w = Workspace::new(&crate::config::Config::default());
+                    w.page = Page::Setup;
+                    w.picker = Some(Picker {
+                        kind,
+                        query: String::new(),
+                        selected: 0,
+                    });
+                    let report = Report::default();
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw_workspace(
+                                frame,
+                                &View {
+                                    screen: Screen::Workspace,
+                                    selected: 0,
+                                    report: &report,
+                                    theme: Theme::named(theme),
+                                    scroll: 0,
+                                    elapsed: 0,
+                                },
+                                Some(&w),
+                            );
+                        })
+                        .unwrap();
+                    let text: String = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|c| c.symbol())
+                        .collect();
+                    assert!(text.contains(if kind == PickerKind::Provider {
+                        "Choose a provider"
+                    } else {
+                        "Choose a model"
+                    }));
+                    assert!(text.contains("Enter select"));
+                    assert!(text.contains("Esc cancel"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn primary_buttons_share_dimensions_and_center_labels() {
@@ -739,9 +1343,9 @@ mod tests {
 
     #[test]
     fn paper_welcome_retains_selected_row_and_action_at_standard_size() {
-        for selected in [0, 1] {
+        for selected in [0, 1, 2] {
             let theme = Theme::named("dark");
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
             terminal
                 .draw(|frame| {
                     draw(
@@ -761,11 +1365,14 @@ mod tests {
             let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
             assert!(text.contains("Start with a simulated arm."));
             assert!(text.contains("Try the offline demo"));
-            assert!(text.contains("CLI reference & controls"));
+            assert!(text.contains("Configure a provider"));
+            assert!(text.contains("Open a saved session"));
             assert!(text.contains(if selected == 0 {
                 "Review offline demo"
+            } else if selected == 1 {
+                "Configure a provider"
             } else {
-                "Open CLI reference"
+                "Open a saved session"
             }));
             assert!(buffer.content.iter().any(|cell| cell.bg == theme.selected));
         }

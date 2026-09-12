@@ -119,6 +119,43 @@ fn model(args: &[String], cfg: &Config, demo: bool) -> Result<Arc<dyn Model>, St
 }
 
 pub(crate) async fn resume(args: &[String], cfg: &Config) -> Result<i32, String> {
+    resume_controlled(args, cfg, RunControl::cli(args)).await
+}
+
+/// Provider-backed terminal requests retain the same preflight, lease, tool,
+/// journal and cleanup code as the scriptable commands.
+pub(crate) async fn interactive_request(
+    args: &[String],
+    cfg: &Config,
+    output: Arc<dyn RunOutput>,
+    stop: StopToken,
+) -> Result<i32, String> {
+    let control = RunControl {
+        output,
+        stop,
+        listen_for_signal: false,
+    };
+    if args.first().map(String::as_str) == Some("resume") {
+        return resume_controlled(args, cfg, control).await;
+    }
+    ensure_driver(args, cfg)?;
+    run_loop(
+        args,
+        cfg,
+        model(args, cfg, false)?,
+        prompt_from_args(args)?,
+        false,
+        None,
+        control,
+    )
+    .await
+}
+
+async fn resume_controlled(
+    args: &[String],
+    cfg: &Config,
+    control: RunControl,
+) -> Result<i32, String> {
     ensure_driver(args, cfg)?;
     let sid = args.get(1).ok_or("session ID is required")?.clone();
     let st = store(args, Some(cfg))?;
@@ -143,7 +180,7 @@ pub(crate) async fn resume(args: &[String], cfg: &Config) -> Result<i32, String>
         prompt,
         has(args, "--demo"),
         Some((sid, guard, session)),
-        RunControl::cli(args),
+        control,
     )
     .await
 }

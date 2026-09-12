@@ -37,6 +37,9 @@ impl Phase {
 
 #[derive(Clone, Debug)]
 pub(super) struct Report {
+    pub(super) demo: bool,
+    pub(super) answer: String,
+    pub(super) post_observed: Option<f64>,
     pub(super) phase: Phase,
     pub(super) session: Option<String>,
     pub(super) store: String,
@@ -53,6 +56,9 @@ pub(super) struct Report {
 impl Default for Report {
     fn default() -> Self {
         Self {
+            demo: true,
+            answer: String::new(),
+            post_observed: None,
             phase: Phase::Ready,
             session: None,
             store: String::new(),
@@ -140,7 +146,16 @@ impl Report {
                         let observed = finite(
                             &metadata["metadata"]["post_action_state"]["joints"]["shoulder"],
                         );
-                        if metadata["accepted"] == true {
+                        if metadata["accepted"] == true && !self.demo {
+                            self.post_observed = observed;
+                            self.record(&format!(
+                                "Command result / inspect evidence: {}",
+                                metadata
+                            ));
+                        } else if metadata["accepted"] == false {
+                            self.record(&format!("Command rejected: {}", metadata));
+                        }
+                        if metadata["accepted"] == true && self.demo {
                             if let Some(value) = observed.filter(|v| (v - 0.2).abs() <= 1e-6) {
                                 self.verified = Some(value);
                                 // JournalTool only returns after the verified
@@ -155,7 +170,8 @@ impl Report {
                             "! Tool reported an error. This is not evidence of verification.",
                         );
                     }
-                    Event::RunCompleted { .. } => {
+                    Event::RunCompleted { output, .. } => {
+                        self.answer = safe_text(&output);
                         self.record("+ Model finished. Saving the terminal snapshot.")
                     }
                     Event::RunFailed { error, .. } => self.record(&format!("! {error}")),

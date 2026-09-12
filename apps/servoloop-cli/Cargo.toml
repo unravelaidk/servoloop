@@ -17,6 +17,8 @@ servoloop-store = { path = "../../crates/servoloop-store" }
 servoloop-robot = { path = "../../crates/servoloop-robot" }
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3"
+url = "2"
 tokio.workspace = true
 async-trait.workspace = true
 crossterm = { version = "0.28.1", features = ["event-stream"] }

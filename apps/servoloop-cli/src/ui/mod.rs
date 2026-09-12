@@ -1,7 +1,9 @@
 //! Opt-in presentation over the existing CLI execution engine. No provider,
 //! storage, or robot operations run merely by opening a view.
+mod settings;
 mod state;
 mod view;
+mod workspace;
 
 use crate::{args::value, config::Config, execution};
 use crossterm::{
@@ -32,12 +34,14 @@ enum Screen {
     Activity,
     Inspect,
     Help,
+    Workspace,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
     Start,
+    Send,
     Cancel,
     Quit,
 }
@@ -90,7 +94,7 @@ impl Navigation {
             KeyCode::Esc => {
                 self.screen = match self.screen {
                     Screen::Review => Screen::Welcome,
-                    Screen::Inspect => Screen::Activity,
+                    Screen::Inspect => self.previous,
                     Screen::Help => self.previous,
                     screen => screen,
                 };
@@ -100,14 +104,17 @@ impl Navigation {
                     0
                 };
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::Tab if self.screen == Screen::Welcome => {
-                self.selected = 1 - self.selected
+            KeyCode::Up if self.screen == Screen::Welcome => {
+                self.selected = (self.selected + 2) % 3
+            }
+            KeyCode::Down | KeyCode::Tab if self.screen == Screen::Welcome => {
+                self.selected = (self.selected + 1) % 3
             }
             KeyCode::Enter if self.screen == Screen::Welcome => {
                 self.screen = if self.selected == 0 {
                     Screen::Review
                 } else {
-                    Screen::Help
+                    Screen::Workspace
                 };
                 self.previous = Screen::Welcome;
                 self.scroll = 0;
@@ -119,6 +126,7 @@ impl Navigation {
                 return Action::Start;
             }
             KeyCode::Char('i') if self.screen == Screen::Activity => {
+                self.previous = Screen::Activity;
                 self.activity_scroll = self.scroll;
                 self.screen = Screen::Inspect;
                 self.scroll = 0;
@@ -230,21 +238,31 @@ async fn interact(
     theme: Theme,
 ) -> Result<i32, String> {
     let mut nav = Navigation::default();
+    let mut workspace = workspace::Workspace::new(cfg);
+    workspace.settings = Some(settings::Settings::open(crate::config::config_path(args))?);
     let mut started = None;
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     let mut events = EventStream::new();
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        workspace.poll().await;
         if task.as_ref().is_some_and(JoinHandle::is_finished) {
             let result = task
                 .take()
                 .expect("finished task")
                 .await
                 .unwrap_or_else(|e| Err(format!("execution task failed: {e}")));
-            report
-                .lock()
-                .map_err(|_| "terminal report lock failed")?
-                .finish(result);
+            let mut report = report.lock().map_err(|_| "terminal report lock failed")?;
+            report.finish(result);
+            if report.phase == Phase::Complete && !report.demo {
+                workspace.session = report.session.clone();
+                workspace
+                    .history
+                    .push(format!("ServoLoop: {}", report.answer));
+                if workspace.history.len() > 64 {
+                    workspace.history.drain(..workspace.history.len() - 64);
+                }
+            }
         }
         let snapshot = report
             .lock()
@@ -255,7 +273,7 @@ async fn interact(
             .0
             .draw(|frame| {
                 usable = frame.area().width >= 48 && frame.area().height >= 18;
-                nav.scroll = view::draw(
+                nav.scroll = view::draw_workspace(
                     frame,
                     &View {
                         screen: nav.screen,
@@ -265,6 +283,7 @@ async fn interact(
                         scroll: nav.scroll,
                         elapsed: started.map(|s: Instant| s.elapsed().as_secs()).unwrap_or(0),
                     },
+                    Some(&workspace),
                 )
             })
             .map_err(|e| format!("terminal draw: {e}"))?;
@@ -274,9 +293,48 @@ async fn interact(
                 Some(Ok(Event::Key(key))) => {
                     let exit_or_cancel = key.code == KeyCode::Char('q') ||
                         (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
-                    if usable || exit_or_cancel { nav.key(key, snapshot.phase, task.is_some()) } else { Action::None }
+                    if (!usable && !exit_or_cancel) || key.kind != KeyEventKind::Press { Action::None }
+                    else if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        if workspace.busy() { workspace.cancel_job(); workspace.status = "Operation cancelled. Nothing applied.".into(); Action::None }
+                        else { nav.key(key, snapshot.phase, task.is_some()) }
+                    }
+                    else if nav.screen == Screen::Workspace {
+                        if key.code == KeyCode::Char('q') && !workspace.editing && workspace.picker.is_none() {
+                            nav.key(key, snapshot.phase, task.is_some())
+                        } else {
+                            match workspace.key(key, args, task.is_some()) {
+                                workspace::Intent::Back => { nav.screen = if task.is_some() { Screen::Activity } else { Screen::Welcome }; nav.scroll = 0; Action::None },
+                                workspace::Intent::Demo => { nav.screen = Screen::Review; nav.scroll = 0; Action::None },
+                                workspace::Intent::Inspect => { nav.previous = Screen::Workspace; nav.screen = Screen::Inspect; nav.scroll = 0; Action::None },
+                                workspace::Intent::Help => { nav.previous = Screen::Workspace; nav.screen = Screen::Help; nav.scroll = 0; Action::None },
+                                workspace::Intent::Send => Action::Send,
+                                workspace::Intent::None => {
+                                    if matches!(key.code, KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home) && !workspace.editing && workspace.picker.is_none() {
+                                        nav.key(key, snapshot.phase, task.is_some());
+                                    }
+                                    Action::None
+                                },
+                            }
+                        }
+                    } else if key.code == KeyCode::Char('/') {
+                        workspace.open(workspace::Page::Palette, args); nav.screen = Screen::Workspace; nav.scroll = 0; Action::None
+                    } else if key.code == KeyCode::Char('c') && nav.screen == Screen::Activity && snapshot.phase == Phase::Complete {
+                        workspace.session = snapshot.session.clone();
+                        workspace.page = workspace::Page::Conversation;
+                        nav.screen = Screen::Workspace; nav.scroll = 0; Action::None
+                    } else {
+                        let action = nav.key(key, snapshot.phase, task.is_some());
+                        if nav.screen == Screen::Workspace {
+                            workspace.open(if nav.selected == 1 { workspace::Page::Setup } else { workspace::Page::Sessions }, args);
+                        }
+                        action
+                    }
                 },
-                // Pasted newlines or an 'r' cannot launch the fixed demo.
+                Some(Ok(Event::Paste(text))) if usable && nav.screen == Screen::Workspace => {
+                    workspace.paste(&text);
+                    Action::None
+                },
+                // Pasting into non-editable views cannot launch the demo.
                 Some(Ok(_)) => Action::None,
                 Some(Err(error)) => return Err(format!("terminal input: {error}")),
                 None => return Err("terminal input closed".into()),
@@ -288,6 +346,42 @@ async fn interact(
             }
         };
         match action {
+            Action::Send => {
+                if matches!(snapshot.phase, Phase::Failed | Phase::Interrupted) {
+                    workspace.status = "Inspect the failed/interrupted run before continuing. No retry from this workspace.".into();
+                    continue;
+                }
+                let run_args = match workspace.run_args(args) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        workspace.status = error;
+                        continue;
+                    }
+                };
+                if task.is_some() {
+                    continue;
+                }
+                *report.lock().map_err(|_| "terminal report lock failed")? = Report {
+                    phase: Phase::Running,
+                    store: snapshot.store.clone(),
+                    demo: false,
+                    ..Report::default()
+                };
+                *stop = StopToken::new();
+                let run_stop = stop.clone();
+                let output = Arc::new(UiOutput(report.clone()));
+                let cfg = workspace.config.clone();
+                workspace
+                    .history
+                    .push(format!("You: {}", state::safe_text(&workspace.draft)));
+                workspace.draft.clear();
+                started = Some(Instant::now());
+                nav.screen = Screen::Activity;
+                nav.scroll = 0;
+                *task = Some(tokio::spawn(async move {
+                    execution::interactive_request(&run_args, &cfg, output, run_stop).await
+                }));
+            }
             Action::Start => {
                 *report.lock().map_err(|_| "terminal report lock failed")? = Report {
                     phase: Phase::Running,

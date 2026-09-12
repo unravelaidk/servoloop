@@ -22,10 +22,28 @@ content was inspected along with full-scale visual samples and the current
 Rust implementation. The Paper board remains unchanged as the original
 reference; the improvements described here are implemented in the terminal UI.
 
-The user approved this first slice: welcome, explicit offline-demo review,
-execution activity, and evidence inspection. Provider configuration, persistent
-free-form conversation, saved-session navigation, and updates remain later
-work, not disabled controls masquerading as implemented features.
+The user first approved welcome, explicit offline-demo review, execution
+activity, and evidence inspection, then approved extending the Paper workflows.
+The current implementation also supports provider settings, searchable picker
+popups, provider-backed prompts, saved-session browsing, preflight, continuation,
+and a command palette. The update page provides manual guidance, not a working
+installer. Dedicated Paper recovery layouts remain unfinished; the current
+activity and inspector retain the underlying error and evidence states.
+
+### Searchable provider and model selection
+
+Provider and model fields open a centered picker over the settings view. Typing
+filters the list; arrows move selection; Enter selects; Escape leaves the
+pending value unchanged. Selection does not save settings or submit a prompt.
+The provider picker uses supported provider definitions. The model picker reuses
+the cached discovery service, merging Models.dev's `api.json` with live endpoint
+results. Catalog-only provenance and unknown capabilities remain explicit.
+Custom model IDs remain available when discovery fails. Save is a separate,
+atomic configuration write; in-flight execution retains its original settings.
+
+![Searchable provider popup over the Paper-style configuration view](images/terminal-provider-picker.png)
+
+![Model popup showing discovered models and capability metadata from a local test fixture](images/terminal-model-picker.png)
 
 The working context is a developer using a local terminal alongside code and
 logs. Following the user's visual-fidelity feedback, the UI uses the Paper
@@ -117,7 +135,12 @@ The code separates responsibilities without duplicating the execution engine:
   lifecycle, cancellation, and background-run ownership.
 - `apps/servoloop-cli/src/ui/state.rs`: bounded presentation state and
   evidence-based event interpretation.
-- `apps/servoloop-cli/src/ui/view.rs`: terminal layouts and semantic palettes.
+- `apps/servoloop-cli/src/ui/view.rs`: terminal layouts, picker overlays, and
+  semantic palettes.
+- `apps/servoloop-cli/src/ui/workspace.rs`: provider/model selection, bounded
+  draft editing, session inspection, preflight, and command navigation.
+- `apps/servoloop-cli/src/ui/settings.rs`: explicit atomic config writes with
+  stale-edit detection and cooperative locking.
 - `apps/servoloop-cli/src/execution.rs`: shared model, tool, journal, snapshot,
   and cleanup path for both terminal and scriptable runs.
 - `apps/servoloop-cli/src/output.rs`: separate NDJSON and terminal output sinks.
@@ -147,7 +170,8 @@ real Windows/macOS terminal interaction. No actual Isaac Sim, GPU, model API,
 hardware, screen reader, or live update installation was tested.
 
 Next work should add typed phase/outcome events before richer progress UI,
-then provider configuration and conversation. Resume preflight must preserve
-the current no-replay and journal-consistency checks. Updating the legacy
+complete the dedicated recovery layouts, improve the conversation editor, and
+add installation-provenance checks before offering updates. Resume preflight
+preserves the current no-replay and journal-consistency checks. Updating the legacy
 `verified` event requires an explicit compatibility plan rather than a visual
 rename inside this feature.

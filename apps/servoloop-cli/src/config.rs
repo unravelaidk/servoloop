@@ -82,10 +82,7 @@ fn default_config_path() -> PathBuf {
 }
 pub(crate) fn load(args: &[String]) -> Result<Config, String> {
     let explicit = value(args, "--config").is_some() || env::var_os("SERVOLOOP_CONFIG").is_some();
-    let path = value(args, "--config")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("SERVOLOOP_CONFIG").map(PathBuf::from))
-        .unwrap_or_else(default_config_path);
+    let path = config_path(args);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if !explicit && e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
@@ -99,6 +96,13 @@ pub(crate) fn load(args: &[String]) -> Result<Config, String> {
         ));
     }
     Ok(c)
+}
+
+pub(crate) fn config_path(args: &[String]) -> PathBuf {
+    value(args, "--config")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("SERVOLOOP_CONFIG").map(PathBuf::from))
+        .unwrap_or_else(default_config_path)
 }
 
 use crate::args::value;
