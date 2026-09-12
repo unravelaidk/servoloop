@@ -1,0 +1,1329 @@
+//! Stateful Paper workflows. Navigation does not dispatch tools. Network
+//! discovery and session inspection are explicit, cancellable operations.
+use super::state::safe_text;
+use crate::{
+    catalog_provider::CatalogConnection,
+    commands::provider,
+    config::{store, store_path, Config},
+};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use servoloop_providers::{
+    CatalogProvider, DiscoveredModel, Discovery, DiscoveryOptions, ProviderSpec, Secret,
+    ToolSupport,
+};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::task::JoinHandle;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Page {
+    Setup,
+    Sessions,
+    Preflight,
+    Conversation,
+    Palette,
+    Updates,
+}
+
+pub(super) enum Intent {
+    None,
+    Back,
+    Demo,
+    Inspect,
+    Help,
+    Send,
+}
+
+enum Loaded {
+    Providers(Vec<CatalogProvider>),
+    Models(Vec<DiscoveredModel>),
+    Sessions(Vec<String>),
+    Preflight { id: String, history: Vec<String> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PickerKind {
+    Provider,
+    Model,
+}
+
+pub(super) struct Picker {
+    pub kind: PickerKind,
+    pub query: String,
+    pub selected: usize,
+}
+
+pub(super) struct KeyEntry {
+    pub provider: String,
+    pub endpoint: String,
+    value: String,
+    pub error: Option<&'static str>,
+}
+
+impl KeyEntry {
+    pub fn masked(&self) -> String {
+        "•".repeat(self.value.chars().count().min(32))
+    }
+}
+
+pub(super) struct Choice {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub enabled: bool,
+}
+
+pub(super) struct Workspace {
+    pub page: Page,
+    pub return_page: Page,
+    pub config: Config,
+    pub provider: String,
+    pub endpoint: String,
+    pub model: String,
+    pub draft: String,
+    pub query: String,
+    pub selected: usize,
+    pub field: usize,
+    pub editing: bool,
+    pub status: String,
+    pub sessions: Vec<String>,
+    pub models: Vec<DiscoveredModel>,
+    pub providers: Vec<CatalogProvider>,
+    pub pending_profile: Option<CatalogConnection>,
+    catalog_loaded: Option<Instant>,
+    pub session: Option<String>,
+    pub history: Vec<String>,
+    pub preflight_ok: bool,
+    pub settings: Option<super::settings::Settings>,
+    pub picker: Option<Picker>,
+    pub key_entry: Option<KeyEntry>,
+    keys: HashMap<(String, String), Secret>,
+    discovery: Arc<Discovery>,
+    job: Option<JoinHandle<Result<Loaded, String>>>,
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.abort();
+        }
+    }
+}
+
+impl Workspace {
+    pub fn paste(&mut self, text: &str) {
+        let target = if let Some(entry) = &mut self.key_entry {
+            &mut entry.value
+        } else if let Some(picker) = &mut self.picker {
+            picker.selected = 0;
+            &mut picker.query
+        } else if self.editing {
+            match self.page {
+                Page::Setup => {
+                    if self.field == 1 {
+                        &mut self.endpoint
+                    } else {
+                        return;
+                    }
+                }
+                Page::Conversation => &mut self.draft,
+                _ => &mut self.query,
+            }
+        } else {
+            return;
+        };
+        for ch in text.chars().filter(|c| !c.is_control()) {
+            if target.len() + ch.len_utf8() > 8192 {
+                break;
+            }
+            target.push(ch);
+        }
+    }
+
+    pub fn new(cfg: &Config) -> Self {
+        let mut cfg = cfg.clone();
+        cfg.provider = std::env::var("SERVOLOOP_PROVIDER").ok().or(cfg.provider);
+        cfg.model = std::env::var("SERVOLOOP_MODEL").ok().or(cfg.model);
+        cfg.base_url = std::env::var("SERVOLOOP_BASE_URL").ok().or(cfg.base_url);
+        Self {
+            page: Page::Setup,
+            return_page: Page::Conversation,
+            config: cfg.clone(),
+            provider: cfg.provider.clone().unwrap_or_else(|| "openai".into()),
+            endpoint: cfg.base_url.clone().unwrap_or_default(),
+            model: cfg.model.clone().unwrap_or_default(),
+            draft: String::new(),
+            query: String::new(),
+            selected: 0,
+            field: 0,
+            editing: false,
+            status: String::new(),
+            sessions: vec![],
+            models: vec![],
+            providers: vec![],
+            pending_profile: cfg.provider_profile.clone(),
+            catalog_loaded: None,
+            session: None,
+            history: vec![],
+            preflight_ok: false,
+            settings: None,
+            picker: None,
+            key_entry: None,
+            keys: HashMap::new(),
+            discovery: Arc::new(Discovery::new()),
+            job: None,
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    pub fn credential_source(&self) -> String {
+        if self.pending_key().is_some() {
+            return "Workspace API key · memory only".into();
+        }
+        if let Some(profile) = self
+            .pending_profile
+            .as_ref()
+            .filter(|p| p.id == self.provider)
+        {
+            return if profile.credential_env.is_empty() {
+                "No credential required".into()
+            } else {
+                profile.credential_env.join(" / ")
+            };
+        }
+        provider(&self.provider, None)
+            .map(|spec| {
+                if spec.env_key_names.is_empty() {
+                    "No credential required".into()
+                } else {
+                    spec.env_key_names.join(" / ")
+                }
+            })
+            .unwrap_or_else(|_| "Select a catalog provider".into())
+    }
+
+    pub fn open(&mut self, page: Page, args: &[String]) {
+        self.key_entry = None;
+        self.picker = None;
+        self.cancel_job();
+        self.page = page;
+        self.selected = 0;
+        self.field = 0;
+        self.editing = false;
+        self.query.clear();
+        self.status.clear();
+        if page == Page::Setup {
+            self.pending_profile = self.config.provider_profile.clone();
+            self.provider = self
+                .config
+                .provider
+                .clone()
+                .unwrap_or_else(|| "openai".into());
+            self.endpoint = self.config.base_url.clone().unwrap_or_default();
+            self.model = self.config.model.clone().unwrap_or_default();
+        }
+        if page == Page::Sessions {
+            self.sessions.clear();
+            let args = args.to_vec();
+            let cfg = self.config.clone();
+            self.status = "Loading local sessions…".into();
+            self.job = Some(tokio::task::spawn_blocking(move || {
+                if !store_path(&args, Some(&cfg)).exists() {
+                    return Ok(Loaded::Sessions(vec![]));
+                }
+                let mut sessions = store(&args, Some(&cfg))?
+                    .sessions()
+                    .map_err(|e| e.to_string())?;
+                sessions.sort();
+                Ok(Loaded::Sessions(sessions))
+            }));
+        }
+    }
+
+    pub fn cancel_job(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.abort();
+        }
+    }
+
+    pub async fn poll(&mut self) {
+        if !self.job.as_ref().is_some_and(JoinHandle::is_finished) {
+            return;
+        }
+        let result = self
+            .job
+            .take()
+            .expect("finished job")
+            .await
+            .unwrap_or_else(|e| Err(format!("Background operation failed: {e}")));
+        match result {
+            Ok(Loaded::Providers(providers)) => {
+                self.providers = providers;
+                self.catalog_loaded = Some(Instant::now());
+                if let Some(picker) = self
+                    .picker
+                    .as_mut()
+                    .filter(|p| p.kind == PickerKind::Provider && p.query.is_empty())
+                {
+                    picker.selected = self
+                        .providers
+                        .iter()
+                        .position(|p| p.id == self.provider)
+                        .unwrap_or(0);
+                }
+                self.status = format!(
+                    "{} catalog providers · unsupported adapters are labeled · nothing applied",
+                    self.providers.len()
+                );
+            }
+            Ok(Loaded::Models(models)) => {
+                let endpoint_count = models.iter().filter(|m| m.from_endpoint).count();
+                self.models = models;
+                self.status = if endpoint_count > 0 {
+                    format!("Endpoint returned {endpoint_count} models. This is not a tool-execution test.")
+                } else {
+                    "No endpoint models confirmed. Enter a model ID manually; capabilities remain unknown.".into()
+                };
+            }
+            Ok(Loaded::Sessions(sessions)) => {
+                self.status = format!("{} saved sessions · local storage", sessions.len());
+                self.sessions = sessions;
+            }
+            Ok(Loaded::Preflight { id, history }) => {
+                self.session = Some(id);
+                self.history = history;
+                self.preflight_ok = true;
+                self.status =
+                    "Session and journal consistency checks passed. Rechecked on Send.".into();
+            }
+            Err(error) => {
+                self.status = safe_text(&error);
+                self.preflight_ok = false;
+            }
+        }
+    }
+
+    pub fn filtered_sessions(&self) -> Vec<&String> {
+        self.sessions
+            .iter()
+            .filter(|s| s.to_lowercase().contains(&self.query.to_lowercase()))
+            .collect()
+    }
+
+    pub fn palette(&self) -> Vec<(&'static str, &'static str)> {
+        [
+            ("/model", "Choose a provider and model"),
+            ("/sessions", "Find and resume a saved conversation"),
+            ("/inspect", "Review the active execution and environment"),
+            ("/update", "Installation and update guidance"),
+            ("/help", "Keyboard shortcuts and simulator limitations"),
+            ("/demo", "Review the fixed offline demo"),
+        ]
+        .into_iter()
+        .filter(|(name, detail)| format!("{name} {detail}").contains(&self.query.to_lowercase()))
+        .collect()
+    }
+
+    pub fn key(&mut self, key: KeyEvent, args: &[String], running: bool) -> Intent {
+        if self.key_entry.is_some() {
+            self.key_entry_key(key);
+            return Intent::None;
+        }
+        if self.picker.is_some() {
+            self.picker_key(key);
+            return Intent::None;
+        }
+        if key.code == KeyCode::Esc {
+            if self.editing {
+                self.editing = false;
+                return Intent::None;
+            }
+            self.cancel_job();
+            match self.page {
+                Page::Preflight => self.open(Page::Sessions, args),
+                Page::Palette => {
+                    self.page = self.return_page;
+                    self.query.clear();
+                }
+                _ => return Intent::Back,
+            }
+            return Intent::None;
+        }
+        if self.editing {
+            if key.code == KeyCode::Enter {
+                self.editing = false;
+                return Intent::None;
+            }
+            let target = match self.page {
+                Page::Setup => match self.field {
+                    0 => &mut self.provider,
+                    1 => &mut self.endpoint,
+                    _ => &mut self.model,
+                },
+                Page::Conversation => &mut self.draft,
+                _ => &mut self.query,
+            };
+            edit(target, key);
+            return Intent::None;
+        }
+        if key.code == KeyCode::Char('/') {
+            self.return_page = self.page;
+            self.open(Page::Palette, args);
+            return Intent::None;
+        }
+        match self.page {
+            Page::Setup => match key.code {
+                KeyCode::Tab | KeyCode::Down => self.field = (self.field + 1) % 6,
+                KeyCode::BackTab | KeyCode::Up => self.field = (self.field + 5) % 6,
+                KeyCode::Enter if self.field == 0 => self.open_picker(PickerKind::Provider),
+                KeyCode::Enter if self.field == 1 => self.editing = true,
+                KeyCode::Enter if self.field == 2 => self.begin_key_entry(),
+                KeyCode::Enter if self.field == 3 || self.field == 4 => {
+                    self.open_picker(PickerKind::Model)
+                }
+                KeyCode::Enter if self.field == 5 => self.apply(),
+                _ => {}
+            },
+            Page::Sessions => match key.code {
+                KeyCode::Char('e') => self.editing = true,
+                KeyCode::Char('r') => self.open(Page::Sessions, args),
+                KeyCode::Down => {
+                    self.selected = self
+                        .selected
+                        .saturating_add(1)
+                        .min(self.filtered_sessions().len().saturating_sub(1))
+                }
+                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Enter if !self.busy() => {
+                    if let Some(id) = self
+                        .filtered_sessions()
+                        .get(self.selected)
+                        .map(|s| (*s).clone())
+                    {
+                        self.preflight(args, id);
+                    }
+                }
+                _ => {}
+            },
+            Page::Preflight => {
+                if key.code == KeyCode::Enter && self.preflight_ok && !self.busy() {
+                    self.page = Page::Conversation;
+                    self.status =
+                        "Conversation restored. Fresh simulator; no commands replayed.".into();
+                }
+            }
+            Page::Conversation => match key.code {
+                KeyCode::Char('m') => {
+                    self.open(Page::Setup, args);
+                    self.field = 3;
+                    self.open_picker(PickerKind::Model);
+                }
+                KeyCode::Char('e') => self.editing = true,
+                KeyCode::Char('s') if !running && !self.draft.trim().is_empty() => {
+                    return Intent::Send
+                }
+                KeyCode::Char('i') => return Intent::Inspect,
+                KeyCode::Char('1') => self.draft = "Inspect the current joint positions.".into(),
+                KeyCode::Char('2') => {
+                    self.draft =
+                        "Move the shoulder to 0.2 radians and verify the final position.".into()
+                }
+                KeyCode::Char('3') => {
+                    self.draft = "Explain the execution limits before any motion.".into()
+                }
+                _ => {}
+            },
+            Page::Palette => match key.code {
+                KeyCode::Char('e') => self.editing = true,
+                KeyCode::Down => {
+                    self.selected = self
+                        .selected
+                        .saturating_add(1)
+                        .min(self.palette().len().saturating_sub(1))
+                }
+                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Enter => {
+                    if let Some((name, _)) = self.palette().get(self.selected).copied() {
+                        match name {
+                            "/model" => self.open(Page::Setup, args),
+                            "/sessions" if !running => self.open(Page::Sessions, args),
+                            "/sessions" => {
+                                self.status =
+                                    "Wait for the active run to settle before switching sessions."
+                                        .into()
+                            }
+                            "/inspect" => return Intent::Inspect,
+                            "/help" => return Intent::Help,
+                            "/demo" if !running => return Intent::Demo,
+                            "/demo" => {
+                                self.status = "Wait for cleanup before opening another run.".into()
+                            }
+                            "/update" => self.open(Page::Updates, args),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Page::Updates => {}
+        }
+        Intent::None
+    }
+
+    fn discover(&mut self) {
+        if let Err(error) = validate_endpoint(&self.endpoint) {
+            self.status = error;
+            return;
+        }
+        self.cancel_job();
+        let spec = match self.selected_spec() {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.status = safe_text(&error);
+                return;
+            }
+        };
+        self.models.clear();
+        self.selected = 0;
+        self.status = "Loading Models.dev catalog and endpoint models… Nothing applied.".into();
+        let discovery = self.discovery.clone();
+        self.job = Some(tokio::spawn(async move {
+            let options = DiscoveryOptions {
+                include_models_dev: true,
+                ..Default::default()
+            };
+            discovery
+                .discover(&spec, &options)
+                .await
+                .map(Loaded::Models)
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    pub fn choices(&self, picker: &Picker) -> Vec<Choice> {
+        let query = picker.query.trim().to_lowercase();
+        let mut choices: Vec<_> = match picker.kind {
+            PickerKind::Provider => self
+                .providers
+                .iter()
+                .map(|p| {
+                    let connection = CatalogConnection::from(p);
+                    Choice {
+                        id: p.id.clone(),
+                        title: format!(
+                            "{}{}",
+                            p.name,
+                            if connection.supported() {
+                                ""
+                            } else {
+                                " · unsupported adapter"
+                            }
+                        ),
+                        detail: format!(
+                            "{} · {} models · {} · Credentials: {}",
+                            p.base_url.as_deref().unwrap_or("Endpoint must be entered"),
+                            p.models.len(),
+                            if p.npm.is_empty() {
+                                "Protocol unknown"
+                            } else {
+                                &p.npm
+                            },
+                            if p.env.is_empty() {
+                                "none".into()
+                            } else {
+                                p.env.join(" / ")
+                            }
+                        ),
+                        enabled: connection.supported(),
+                    }
+                })
+                .collect::<Vec<_>>(),
+            PickerKind::Model => self
+                .models
+                .iter()
+                .map(|m| Choice {
+                    enabled: true,
+                    id: m.model_id.clone(),
+                    title: if m.name.is_empty() || m.name == m.model_id {
+                        m.model_id.clone()
+                    } else {
+                        format!("{} · {}", m.model_id, m.name)
+                    },
+                    detail: format!(
+                        "Tools: {} · Images: {} · Context: {} · {}{}",
+                        match m.tool_support {
+                            ToolSupport::Yes => "supported",
+                            ToolSupport::No => "not supported",
+                            ToolSupport::Unknown => "unknown",
+                        },
+                        if m.modalities.image_input {
+                            "supported"
+                        } else {
+                            "unknown"
+                        },
+                        if m.context_window == 0 {
+                            "unknown".into()
+                        } else {
+                            m.context_window.to_string()
+                        },
+                        if m.from_endpoint {
+                            "endpoint listed"
+                        } else {
+                            "catalog only"
+                        },
+                        if m.deprecated { " · deprecated" } else { "" }
+                    ),
+                })
+                .collect(),
+        }
+        .into_iter()
+        .filter(|c| {
+            format!("{} {}", c.title, c.id)
+                .to_lowercase()
+                .contains(&query)
+        })
+        .collect();
+        if picker.kind == PickerKind::Model
+            && !picker.query.trim().is_empty()
+            && !self
+                .models
+                .iter()
+                .any(|m| m.model_id == picker.query.trim())
+        {
+            choices.push(Choice {
+                enabled: true,
+                id: picker.query.trim().into(),
+                title: format!("Use custom model: {}", picker.query.trim()),
+                detail: "Not discovered · capabilities unknown · selection does not test the model"
+                    .into(),
+            });
+        }
+        choices
+    }
+
+    pub fn open_picker(&mut self, kind: PickerKind) {
+        self.editing = false;
+        self.picker = Some(Picker {
+            kind,
+            query: String::new(),
+            selected: 0,
+        });
+        if kind == PickerKind::Model {
+            self.discover();
+        } else {
+            self.load_catalog(false);
+            if let Some(index) = self.providers.iter().position(|p| p.id == self.provider) {
+                self.picker.as_mut().expect("opened picker").selected = index;
+            }
+        }
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) {
+        let mut picker = self.picker.take().expect("open picker");
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_job();
+                self.status = "Selection cancelled. Pending settings unchanged.".into();
+                return;
+            }
+            KeyCode::Up | KeyCode::BackTab => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => {
+                picker.selected = picker
+                    .selected
+                    .saturating_add(1)
+                    .min(self.choices(&picker).len().saturating_sub(1))
+            }
+            KeyCode::PageUp => picker.selected = picker.selected.saturating_sub(5),
+            KeyCode::PageDown => {
+                picker.selected = picker
+                    .selected
+                    .saturating_add(5)
+                    .min(self.choices(&picker).len().saturating_sub(1))
+            }
+            KeyCode::F(5) if picker.kind == PickerKind::Model => {
+                picker.selected = 0;
+                self.discovery.clear_cache();
+                self.discover();
+            }
+            KeyCode::F(5) if picker.kind == PickerKind::Provider => {
+                picker.selected = 0;
+                self.load_catalog(true);
+            }
+            KeyCode::Enter => {
+                if let Some(choice) = self.choices(&picker).get(picker.selected) {
+                    if !choice.enabled {
+                        self.status = "This catalog adapter is not implemented. Only OpenAI-compatible Chat Completions can run; selection unchanged.".into();
+                        self.picker = Some(picker);
+                        return;
+                    }
+                    match picker.kind {
+                        PickerKind::Provider => {
+                            let entry = self
+                                .providers
+                                .iter()
+                                .find(|p| p.id == choice.id)
+                                .expect("catalog choice");
+                            let profile = CatalogConnection::from(entry);
+                            if choice.id != self.provider {
+                                self.provider = choice.id.clone();
+                                self.endpoint = profile.endpoint.clone();
+                                self.model.clear();
+                                self.models = entry
+                                    .models
+                                    .iter()
+                                    .map(|m| DiscoveredModel {
+                                        provider_id: entry.id.clone(),
+                                        model_id: m.model_id.clone(),
+                                        name: m.name.clone(),
+                                        tool_support: m.tool_support,
+                                        deprecated: m.deprecated,
+                                        reasoning: m.reasoning,
+                                        modalities: m.modalities.clone(),
+                                        context_window: m.context_window,
+                                        max_output: m.max_output,
+                                        from_endpoint: false,
+                                    })
+                                    .collect();
+                            }
+                            self.pending_profile = Some(profile);
+                            self.cancel_job();
+                            self.status = "Provider selected. Choose a model; Save applies the pending settings.".into();
+                        }
+                        PickerKind::Model => {
+                            self.model = choice.id.clone();
+                            self.cancel_job();
+                            self.status =
+                                "Model selected. Save and continue to apply it to the next run."
+                                    .into();
+                        }
+                    }
+                    return;
+                }
+            }
+            _ => {
+                edit(&mut picker.query, key);
+                picker.selected = 0;
+            }
+        }
+        self.picker = Some(picker);
+    }
+
+    fn apply(&mut self) {
+        if let Err(error) = validate_endpoint(&self.endpoint) {
+            self.status = error;
+            return;
+        }
+        if self.model.trim().is_empty() {
+            self.status = "Enter an exact model ID before applying.".into();
+            return;
+        }
+        let spec = self.selected_spec();
+        if let Err(error) = spec.and_then(|p| p.validate().map_err(|e| e.to_string())) {
+            self.status = safe_text(&error);
+            return;
+        }
+        self.cancel_job();
+        let mut config = self.config.clone();
+        config.provider = Some(self.provider.clone());
+        config.model = Some(self.model.clone());
+        config.base_url = (!self.endpoint.is_empty()).then(|| self.endpoint.clone());
+        config.provider_profile = self
+            .pending_profile
+            .as_ref()
+            .filter(|p| p.id == self.provider)
+            .cloned();
+        if let Some(settings) = &mut self.settings {
+            if let Err(error) = settings.save(&config) {
+                self.status = safe_text(&error);
+                return;
+            }
+        }
+        self.config = config;
+        self.page = Page::Conversation;
+        self.status = "Settings applied to the next run. Active execution unchanged.".into();
+    }
+
+    fn selected_spec(&self) -> Result<ProviderSpec, String> {
+        let base = (!self.endpoint.is_empty()).then(|| self.endpoint.clone());
+        if let Some(profile) = self
+            .pending_profile
+            .as_ref()
+            .filter(|p| p.id == self.provider)
+        {
+            if let Some(key) = self.pending_key() {
+                profile.spec_with_key(base, Some(key))
+            } else {
+                profile.spec(base)
+            }
+        } else {
+            provider(&self.provider, base).map(|spec| {
+                if let Some(key) = self.pending_key() {
+                    spec.with_key(key)
+                } else {
+                    spec
+                }
+            })
+        }
+    }
+
+    fn binding(
+        name: &str,
+        endpoint: &str,
+        profile: Option<&CatalogConnection>,
+    ) -> Result<(String, String), String> {
+        let endpoint = if !endpoint.is_empty() {
+            endpoint.to_owned()
+        } else if let Some(profile) = profile.filter(|p| p.id == name) {
+            profile.endpoint.clone()
+        } else {
+            provider(name, None)?.resolve_endpoint()
+        };
+        validate_endpoint(&endpoint)?;
+        if endpoint.is_empty() {
+            return Err("Choose a provider endpoint before entering an API key.".into());
+        }
+        Ok((name.to_owned(), endpoint.trim_end_matches('/').to_owned()))
+    }
+
+    fn pending_key(&self) -> Option<Secret> {
+        Self::binding(
+            &self.provider,
+            &self.endpoint,
+            self.pending_profile.as_ref(),
+        )
+        .ok()
+        .and_then(|binding| self.keys.get(&binding).cloned())
+    }
+
+    pub fn applied_key(&self) -> Option<Secret> {
+        Self::binding(
+            self.config.provider.as_deref()?,
+            self.config.base_url.as_deref().unwrap_or(""),
+            self.config.provider_profile.as_ref(),
+        )
+        .ok()
+        .and_then(|binding| self.keys.get(&binding).cloned())
+    }
+
+    fn begin_key_entry(&mut self) {
+        match Self::binding(
+            &self.provider,
+            &self.endpoint,
+            self.pending_profile.as_ref(),
+        ) {
+            Ok((provider, endpoint)) => {
+                self.cancel_job();
+                self.key_entry = Some(KeyEntry {
+                    provider,
+                    endpoint,
+                    value: String::new(),
+                    error: None,
+                });
+                self.status =
+                    "Enter an API key for this workspace only. Nothing is saved to disk.".into();
+            }
+            Err(error) => self.status = safe_text(&error),
+        }
+    }
+
+    fn key_entry_key(&mut self, key: KeyEvent) {
+        let mut entry = self.key_entry.take().expect("API key entry open");
+        if key.code == KeyCode::Esc {
+            self.status = "API key entry cancelled. Existing credentials unchanged.".into();
+            return;
+        }
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.keys.remove(&(entry.provider, entry.endpoint));
+            self.status =
+                "Workspace key removed. Environment credentials will be used if configured.".into();
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            let value = entry.value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic()) {
+                entry.error = Some("Enter a non-empty key without spaces.");
+                self.status =
+                    "Enter a non-empty API key without whitespace or control characters.".into();
+            } else {
+                crate::output::register_secret(value);
+                self.keys
+                    .insert((entry.provider, entry.endpoint), Secret::new(value));
+                self.status = "API key added for this workspace only. Save settings to apply pending provider/model changes.".into();
+                return;
+            }
+        } else {
+            edit(&mut entry.value, key);
+        }
+        self.key_entry = Some(entry);
+    }
+
+    fn load_catalog(&mut self, force: bool) {
+        if !force
+            && self
+                .catalog_loaded
+                .is_some_and(|loaded| loaded.elapsed() < Duration::from_secs(300))
+        {
+            self.status = format!(
+                "{} cached catalog providers · F5 refreshes",
+                self.providers.len()
+            );
+            return;
+        }
+        self.cancel_job();
+        self.status = "Loading provider catalog… No credentials sent to the catalog.".into();
+        self.job = Some(tokio::spawn(async {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                servoloop_providers::catalog::fetch_catalog(None),
+            )
+            .await
+            .map_err(|_| "Provider catalog timed out. Press F5 to retry.".to_string())?
+            .map(Loaded::Providers)
+            .map_err(|e| format!("Provider catalog unavailable: {e}. Press F5 to retry."))
+        }));
+    }
+
+    fn preflight(&mut self, args: &[String], id: String) {
+        self.cancel_job();
+        self.page = Page::Preflight;
+        self.preflight_ok = false;
+        self.session = None;
+        self.history.clear();
+        self.status = "Checking session, journal, and execution lease…".into();
+        let args = args.to_vec();
+        let cfg = self.config.clone();
+        self.job = Some(tokio::task::spawn_blocking(move || {
+            let st = store(&args, Some(&cfg))?;
+            if !st.sessions().map_err(|e| e.to_string())?.contains(&id) {
+                return Err("Session no longer exists.".into());
+            }
+            let guard = st
+                .acquire_session(&id)
+                .map_err(|e| format!("Session cannot be opened: {e}"))?;
+            let session = st
+                .load_snapshot_guarded(&guard)
+                .map_err(|e| format!("Session cannot be resumed: {e}"))?;
+            if !st.unresolved(&id).map_err(|e| e.to_string())?.is_empty() {
+                return Err("Unresolved outcomes: resume blocked. No motion replay.".into());
+            }
+            let history = session
+                .messages
+                .iter()
+                .rev()
+                .take(64)
+                .rev()
+                .map(|message| safe_text(&serde_json::to_string(message).unwrap_or_default()))
+                .collect();
+            Ok(Loaded::Preflight { id, history })
+        }));
+    }
+
+    pub fn run_args(&self, args: &[String]) -> Result<Vec<String>, String> {
+        let provider_name = self
+            .config
+            .provider
+            .as_ref()
+            .ok_or("Configure a provider before Send.")?;
+        let model = self
+            .config
+            .model
+            .as_ref()
+            .ok_or("Choose a model before Send.")?;
+        crate::commands::configured_provider_with_key(
+            provider_name,
+            self.config.base_url.clone(),
+            &self.config,
+            self.applied_key(),
+        )?
+        .validate()
+        .map_err(|e| {
+            format!("Authentication is not ready: {e}. Open provider setup to add an API key.")
+        })?;
+        let mut run = vec![
+            "run".into(),
+            "--store".into(),
+            store_path(args, Some(&self.config))
+                .to_string_lossy()
+                .into_owned(),
+            "--provider".into(),
+            provider_name.clone(),
+            "--model".into(),
+            model.clone(),
+            "--prompt".into(),
+            self.draft.clone(),
+        ];
+        if let Some(endpoint) = &self.config.base_url {
+            run.extend(["--base-url".into(), endpoint.clone()]);
+        }
+        if let Some(session) = &self.session {
+            run[0] = "resume".into();
+            run.insert(1, session.clone());
+        }
+        Ok(run)
+    }
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    let url =
+        url::Url::parse(endpoint).map_err(|_| "Enter an absolute HTTP(S) endpoint.".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Enter an absolute HTTP(S) endpoint.".into());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Endpoint must not contain credentials, query parameters, or fragments. Use the provider credential environment variable.".into());
+    }
+    Ok(())
+}
+
+fn edit(text: &mut String, key: KeyEvent) {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return;
+    }
+    match key.code {
+        KeyCode::Backspace => {
+            text.pop();
+        }
+        KeyCode::Char(ch) if !ch.is_control() && text.len() + ch.len_utf8() <= 8192 => {
+            text.push(ch)
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn workspace() -> Workspace {
+        let mut workspace = Workspace::new(&Config {
+            provider: Some("ollama".into()),
+            model: Some("local-test".into()),
+            ..Config::default()
+        });
+        workspace.providers = servoloop_providers::catalog::parse_catalog(&serde_json::json!({
+            "openrouter": {"name":"OpenRouter", "npm":"@ai-sdk/openai-compatible", "api":"https://catalog.example/v1", "env":[], "models":{"test":{"name":"Test"}}},
+            "ollama": {"name":"Ollama", "npm":"@ai-sdk/openai-compatible", "api":"http://localhost:11434/v1", "env":[], "models":{"test":{"name":"Test"}}},
+            "new-catalog-provider": {"name":"New Catalog Provider", "npm":"@ai-sdk/openai-compatible", "api":"https://catalog.example/v1", "env":[], "models":{"test":{"name":"Test"}}},
+            "unsupported": {"name":"Unsupported", "npm":"@ai-sdk/anthropic", "api":"https://catalog.example", "env":[], "models":{"test":{"name":"Test"}}}
+        })).unwrap();
+        workspace.catalog_loaded = Some(Instant::now());
+        workspace
+    }
+    async fn settle(workspace: &mut Workspace) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while workspace.busy() {
+                workspace.poll().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(servoloop_store::new_id("ui-workflow-test")))
+        }
+        fn args(&self) -> Vec<String> {
+            vec![
+                "ui".into(),
+                "--store".into(),
+                self.0.to_string_lossy().into_owned(),
+            ]
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn entered_key_is_masked_cancel_safe_and_scoped_to_provider_endpoint() {
+        let mut w = workspace();
+        w.begin_key_entry();
+        w.paste("workspace-unit-key");
+        assert!(!w
+            .key_entry
+            .as_ref()
+            .unwrap()
+            .masked()
+            .contains("workspace-unit-key"));
+        assert!(w.pending_key().is_none());
+        w.key_entry_key(key(KeyCode::Enter));
+        assert_eq!(w.pending_key().unwrap().as_str(), "workspace-unit-key");
+        assert!(w.applied_key().is_some());
+        assert!(!serde_json::to_string(&w.config)
+            .unwrap()
+            .contains("workspace-unit-key"));
+        w.begin_key_entry();
+        w.paste("replacement");
+        w.key_entry_key(key(KeyCode::Esc));
+        assert_eq!(w.pending_key().unwrap().as_str(), "workspace-unit-key");
+        w.endpoint = "https://different.invalid/v1".into();
+        assert!(w.pending_key().is_none());
+        assert!(w.applied_key().is_some());
+        w.endpoint.clear();
+        w.provider = "openrouter".into();
+        assert!(w.pending_key().is_none());
+        w.provider = "ollama".into();
+        w.begin_key_entry();
+        w.key_entry_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(w.pending_key().is_none());
+    }
+
+    #[test]
+    fn suggestions_and_editor_enter_do_not_send() {
+        let mut w = workspace();
+        w.page = Page::Conversation;
+        assert!(matches!(
+            w.key(key(KeyCode::Char('2')), &[], false),
+            Intent::None
+        ));
+        assert!(w.draft.contains("0.2"));
+        w.key(key(KeyCode::Char('e')), &[], false);
+        w.key(key(KeyCode::Char('q')), &[], false);
+        assert!(w.draft.ends_with('q'));
+        assert!(matches!(
+            w.key(key(KeyCode::Enter), &[], false),
+            Intent::None
+        ));
+        assert!(matches!(
+            w.key(key(KeyCode::Char('s')), &[], true),
+            Intent::None
+        ));
+        assert!(matches!(
+            w.key(key(KeyCode::Char('s')), &[], false),
+            Intent::Send
+        ));
+    }
+
+    #[test]
+    fn palette_preserves_draft_and_configuration_requires_apply() {
+        let mut w = workspace();
+        w.page = Page::Conversation;
+        w.draft = "inspect only".into();
+        w.key(key(KeyCode::Char('/')), &[], false);
+        assert_eq!(w.page, Page::Palette);
+        w.key(key(KeyCode::Esc), &[], false);
+        assert_eq!(w.page, Page::Conversation);
+        assert_eq!(w.draft, "inspect only");
+        let previous = w.config.model.clone();
+        w.open(Page::Setup, &[]);
+        w.model = "pending-model".into();
+        assert_eq!(w.config.model, previous);
+        w.open(Page::Setup, &[]);
+        assert_eq!(Some(w.model.clone()), previous);
+        w.model = "new-model".into();
+        w.apply();
+        assert_eq!(w.config.model.as_deref(), Some("new-model"));
+        assert_eq!(w.draft, "inspect only");
+    }
+
+    #[tokio::test]
+    async fn empty_session_browser_creates_nothing() {
+        let fixture = Fixture::new();
+        let mut w = workspace();
+        w.open(Page::Sessions, &fixture.args());
+        settle(&mut w).await;
+        assert!(w.sessions.is_empty());
+        assert!(!fixture.0.exists());
+    }
+
+    #[tokio::test]
+    async fn preflight_checks_snapshot_and_lease_without_replaying() {
+        let fixture = Fixture::new();
+        let st = servoloop_store::Store::open(&fixture.0).unwrap();
+        st.create_session("saved").unwrap();
+        st.save_snapshot(&servoloop_core::Session::new("saved"))
+            .unwrap();
+        let mut w = workspace();
+        w.open(Page::Sessions, &fixture.args());
+        settle(&mut w).await;
+        assert_eq!(w.sessions, vec!["saved"]);
+        w.key(key(KeyCode::Enter), &fixture.args(), false);
+        settle(&mut w).await;
+        assert!(w.preflight_ok);
+        assert_eq!(w.session.as_deref(), Some("saved"));
+        assert!(st.records("saved").unwrap().is_empty());
+        assert!(!fixture.0.join("saved/session.lock").exists());
+        let guard = st.acquire_session("saved").unwrap();
+        w.preflight(&fixture.args(), "saved".into());
+        settle(&mut w).await;
+        assert!(!w.preflight_ok);
+        assert!(w.status.contains("busy"));
+        assert!(fixture.0.join("saved/session.lock").exists());
+        assert!(matches!(
+            w.key(key(KeyCode::Enter), &fixture.args(), false),
+            Intent::None
+        ));
+        assert_eq!(w.page, Page::Preflight);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn corrupt_snapshot_is_not_resumable() {
+        let fixture = Fixture::new();
+        let st = servoloop_store::Store::open(&fixture.0).unwrap();
+        st.create_session("broken").unwrap();
+        std::fs::write(fixture.0.join("broken/snapshot.json"), "not json").unwrap();
+        let mut w = workspace();
+        w.preflight(&fixture.args(), "broken".into());
+        settle(&mut w).await;
+        assert!(!w.preflight_ok);
+        assert!(w.session.is_none());
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("broken/snapshot.json")).unwrap(),
+            "not json"
+        );
+    }
+
+    #[test]
+    fn selected_settings_override_environment_and_resume_keeps_id() {
+        let fixture = Fixture::new();
+        let mut w = workspace();
+        w.session = Some("saved".into());
+        w.draft = "observe only".into();
+        let args = w.run_args(&fixture.args()).unwrap();
+        assert_eq!(&args[..2], &["resume", "saved"]);
+        assert_eq!(
+            crate::args::value(&args, "--prompt").as_deref(),
+            Some("observe only")
+        );
+        assert!(!fixture.0.exists());
+    }
+
+    #[test]
+    fn provider_picker_search_cancel_and_confirm_preserve_applied_settings() {
+        let mut w = workspace();
+        let original = w.provider.clone();
+        w.open_picker(PickerKind::Provider);
+        for ch in "openrouter".chars() {
+            w.key(key(KeyCode::Char(ch)), &[], false);
+        }
+        assert_eq!(w.choices(w.picker.as_ref().unwrap()).len(), 1);
+        w.key(key(KeyCode::Esc), &[], false);
+        assert_eq!(w.provider, original);
+        assert!(w.picker.is_none());
+        w.open_picker(PickerKind::Provider);
+        for ch in "OPENROUTER".chars() {
+            w.key(key(KeyCode::Char(ch)), &[], false);
+        }
+        w.key(key(KeyCode::Enter), &[], false);
+        assert_eq!(w.provider, "openrouter");
+        assert_eq!(w.endpoint, "https://catalog.example/v1");
+        assert!(w.model.is_empty());
+        assert_eq!(w.config.provider.as_deref(), Some(original.as_str()));
+    }
+
+    #[test]
+    fn provider_picker_is_catalog_driven_and_refuses_unsupported_adapters() {
+        let mut w = workspace();
+        w.open_picker(PickerKind::Provider);
+        w.paste("new-catalog-provider");
+        w.key(key(KeyCode::Enter), &[], false);
+        assert_eq!(w.provider, "new-catalog-provider");
+        assert_eq!(w.selected_spec().unwrap().id, "new-catalog-provider");
+        assert!(
+            w.config.provider_profile.is_none(),
+            "Selection must not save settings"
+        );
+        w.open_picker(PickerKind::Provider);
+        w.paste("unsupported");
+        assert!(!w.choices(w.picker.as_ref().unwrap())[0].enabled);
+        w.key(key(KeyCode::Enter), &[], false);
+        assert!(w.picker.is_some());
+        assert_eq!(w.provider, "new-catalog-provider");
+    }
+
+    #[test]
+    fn model_picker_preserves_capability_unknowns_and_allows_custom_ids() {
+        let mut w = workspace();
+        w.models = vec![DiscoveredModel {
+            provider_id: "ollama".into(),
+            model_id: "listed-model".into(),
+            name: "Listed".into(),
+            tool_support: ToolSupport::Unknown,
+            deprecated: false,
+            reasoning: false,
+            modalities: Default::default(),
+            context_window: 0,
+            max_output: 0,
+            from_endpoint: true,
+        }];
+        w.picker = Some(Picker {
+            kind: PickerKind::Model,
+            query: "listed".into(),
+            selected: 0,
+        });
+        let choices = w.choices(w.picker.as_ref().unwrap());
+        assert!(choices[0].detail.contains("Tools: unknown"));
+        assert!(choices[0].detail.contains("Images: unknown"));
+        assert!(choices[0].detail.contains("Context: unknown"));
+        assert!(choices[0].detail.contains("endpoint listed"));
+        let applied = w.config.model.clone();
+        w.key(key(KeyCode::Enter), &[], false);
+        assert_eq!(w.model, "listed-model");
+        assert_eq!(w.config.model, applied);
+        w.picker = Some(Picker {
+            kind: PickerKind::Model,
+            query: "custom-model".into(),
+            selected: 0,
+        });
+        assert_eq!(w.choices(w.picker.as_ref().unwrap()).len(), 1);
+        w.key(key(KeyCode::Enter), &[], false);
+        assert_eq!(w.model, "custom-model");
+        assert_eq!(w.config.model, applied);
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_embedded_secrets_and_non_http_urls() {
+        for endpoint in [
+            "file:///etc/passwd",
+            "https://user:secret@host/v1",
+            "https://host/v1?api_key=secret",
+            "relative",
+        ] {
+            assert!(validate_endpoint(endpoint).is_err());
+        }
+        assert!(validate_endpoint("http://127.0.0.1:11434/v1").is_ok());
+    }
+
+    #[test]
+    fn paste_edits_search_or_draft_without_confirming_or_dispatching() {
+        let mut w = workspace();
+        let original = w.config.provider.clone();
+        w.open_picker(PickerKind::Provider);
+        w.paste("openai\r\n");
+        assert_eq!(w.picker.as_ref().unwrap().query, "openai");
+        assert_eq!(w.config.provider, original);
+        assert!(w.picker.is_some());
+        w.key(key(KeyCode::Esc), &[], false);
+        w.page = Page::Conversation;
+        w.editing = true;
+        w.paste("q\r\ns\r\n");
+        assert_eq!(w.draft, "qs");
+        assert!(w.editing);
+        assert!(!w.busy());
+    }
+}

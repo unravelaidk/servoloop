@@ -8,7 +8,9 @@
 
 use crate::discovery::{CatalogModel, CatalogProvider, ModalitySupport, ToolSupport};
 use crate::error::{ProviderError, ProviderResult};
-use crate::transport::{build_client, map_http_error, read_bounded_json, read_bounded_text};
+use crate::transport::{
+    build_client, map_http_error, read_bounded_json_with_limit, read_bounded_text,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -17,6 +19,10 @@ pub const DEFAULT_MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
 /// Environment variable for overriding the catalog URL.
 pub const MODELS_DEV_URL_ENV: &str = "SERVOLOOP_MODELS_DEV_URL";
+
+/// Catalogs contain metadata for many providers, unlike one provider response.
+/// Allow growth beyond the ordinary 4 MiB cap while keeping downloads bounded.
+const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
 /// Resolve the effective catalog URL once for a discovery operation.
 pub fn resolve_catalog_url(url: Option<&str>) -> String {
@@ -46,7 +52,7 @@ pub async fn fetch_catalog(url: Option<&str>) -> ProviderResult<Vec<CatalogProvi
         return Err(map_http_error(status, &body));
     }
 
-    let body = read_bounded_json(response).await?;
+    let body = read_bounded_json_with_limit(response, MAX_CATALOG_BYTES).await?;
     parse_catalog(&body)
 }
 
@@ -87,6 +93,8 @@ fn parse_provider(id: &str, provider: RawProvider) -> Option<CatalogProvider> {
         name: provider.name,
         base_url: provider.api,
         api_key_required: !provider.env.is_empty(),
+        npm: provider.npm,
+        env: provider.env,
         models,
     })
 }

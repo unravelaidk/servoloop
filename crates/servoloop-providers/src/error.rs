@@ -19,7 +19,7 @@ pub enum ProviderError {
     /// The protocol is not implemented by this crate.
     UnsupportedProtocol { protocol: Protocol },
     /// The provider requires an API key but none was provided.
-    MissingKey { provider_id: &'static str },
+    MissingKey { provider_id: String },
     /// Authentication or authorization failure (permanent).
     Auth { redacted_detail: String },
     /// Invalid request or unsupported feature (permanent).
@@ -103,8 +103,10 @@ impl ProviderError {
         ProviderError::UnsupportedProtocol { protocol }
     }
 
-    pub fn missing_key(provider_id: &'static str) -> Self {
-        ProviderError::MissingKey { provider_id }
+    pub fn missing_key(provider_id: impl Into<String>) -> Self {
+        ProviderError::MissingKey {
+            provider_id: provider_id.into(),
+        }
     }
 
     pub fn auth(detail: impl Into<String>) -> Self {

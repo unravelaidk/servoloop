@@ -8,12 +8,24 @@ pub(crate) struct Cli {
 }
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the interactive, simulation-only terminal workspace.
+    Ui(UiArgs),
     Run(RunArgs),
     Resume(ResumeArgs),
     Models(ModelsArgs),
     Providers,
     Config(ConfigArgs),
     Sessions(SessionsArgs),
+}
+#[derive(Debug, Args)]
+struct UiArgs {
+    #[arg(long)]
+    store: Option<PathBuf>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Terminal palette. NO_COLOR overrides this with monochrome output.
+    #[arg(long, default_value = "dark", value_parser = ["dark", "light", "mono"])]
+    theme: String,
 }
 #[derive(Debug, Args)]
 struct CommonArgs {
@@ -115,6 +127,7 @@ pub(crate) fn config_action(args: &[String]) -> &str {
 pub(crate) fn validate_args(args: &[String]) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("");
     let flags: &[&str] = match command {
+        "ui" => &["--store", "--config", "--theme"],
         "run" => &[
             "--demo",
             "--store",
@@ -161,6 +174,7 @@ pub(crate) fn validate_args(args: &[String]) -> Result<(), String> {
         _ => return Err(format!("unknown command `{command}`")),
     };
     let value_flags = [
+        "--theme",
         "--store",
         "--session",
         "--driver",

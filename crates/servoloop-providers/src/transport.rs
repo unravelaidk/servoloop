@@ -46,27 +46,39 @@ pub fn join_url(base: &str, path: &str) -> String {
 ///
 /// Returns an error if the body exceeds [`MAX_RESPONSE_BYTES`].
 pub async fn read_bounded_json(response: reqwest::Response) -> ProviderResult<serde_json::Value> {
+    read_bounded_json_with_limit(response, MAX_RESPONSE_BYTES).await
+}
+
+/// Resource-specific JSON limit, enforced before appending each received
+/// chunk as well as against Content-Length. Missing lengths cannot bypass it.
+pub(crate) async fn read_bounded_json_with_limit(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> ProviderResult<serde_json::Value> {
     let content_length = response.content_length();
     if let Some(len) = content_length {
-        if len as usize > MAX_RESPONSE_BYTES {
+        if len > max_bytes as u64 {
             return Err(ProviderError::malformed(format!(
                 "response body exceeds {} byte limit (declared {})",
-                MAX_RESPONSE_BYTES, len
+                max_bytes, len
             )));
         }
     }
 
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| ProviderError::transient(format!("failed to read response body: {e}")))?;
-
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(ProviderError::malformed(format!(
-            "response body exceeds {} byte limit (received {})",
-            MAX_RESPONSE_BYTES,
-            bytes.len()
-        )));
+        .map_err(|e| ProviderError::transient(format!("failed to read response body: {e}")))?
+    {
+        let received = bytes.len().saturating_add(chunk.len());
+        if received > max_bytes {
+            return Err(ProviderError::malformed(format!(
+                "response body exceeds {} byte limit (received {})",
+                max_bytes, received
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
     }
 
     serde_json::from_slice::<serde_json::Value>(&bytes)

@@ -2,8 +2,46 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     env,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static CATALOG_SECRETS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+pub(crate) fn register_secret(secret: &str) {
+    if secret.is_empty() {
+        return;
+    }
+    let mut secrets = CATALOG_SECRETS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !secrets.iter().any(|existing| existing == secret) {
+        secrets.push(secret.to_owned());
+    }
+}
+
+fn secrets() -> Vec<String> {
+    let mut secrets: Vec<String> = [
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "NVIDIA_API_KEY",
+        "SERVOLOOP_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|name| env::var(name).ok())
+    .collect();
+    if let Some(catalog) = CATALOG_SECRETS.get() {
+        secrets.extend(
+            catalog
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .cloned(),
+        );
+    }
+    secrets
+}
 
 #[derive(Serialize)]
 struct Event<'a> {
@@ -15,12 +53,43 @@ struct Event<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
 }
-pub(crate) fn emit(
-    seq: &mut u64,
-    sid: &str,
-    event: &str,
-    data: Option<Value>,
-) -> Result<(), String> {
+pub(crate) trait RunOutput: Send + Sync {
+    fn starting(&self, _simulated: bool) {}
+    fn emit(
+        &self,
+        seq: &mut u64,
+        sid: &str,
+        event: &str,
+        data: Option<Value>,
+    ) -> Result<(), String>;
+}
+
+pub(crate) struct NdjsonOutput {
+    pub(crate) quiet: bool,
+}
+
+impl RunOutput for NdjsonOutput {
+    fn starting(&self, simulated: bool) {
+        if !self.quiet {
+            eprintln!(
+                "starting {} run",
+                if simulated { "simulated" } else { "provider" }
+            );
+        }
+    }
+
+    fn emit(
+        &self,
+        seq: &mut u64,
+        sid: &str,
+        event: &str,
+        data: Option<Value>,
+    ) -> Result<(), String> {
+        emit(seq, sid, event, data)
+    }
+}
+
+fn emit(seq: &mut u64, sid: &str, event: &str, data: Option<Value>) -> Result<(), String> {
     *seq += 1;
     let value = serde_json::to_value(Event {
         version: 1,
@@ -42,28 +111,10 @@ pub(crate) fn emit(
     Ok(())
 }
 pub(crate) fn redact(input: &str) -> String {
-    let secrets = [
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "NVIDIA_API_KEY",
-        "SERVOLOOP_API_KEY",
-    ]
-    .into_iter()
-    .filter_map(|name| env::var(name).ok())
-    .collect::<Vec<_>>();
-    redact_text(input, &secrets)
+    redact_text(input, &secrets())
 }
 pub(crate) fn redact_value(value: Value) -> Result<Value, String> {
-    let secrets = [
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "NVIDIA_API_KEY",
-        "SERVOLOOP_API_KEY",
-    ]
-    .into_iter()
-    .filter_map(|name| env::var(name).ok())
-    .collect::<Vec<_>>();
-    redact_value_with_secrets(value, &secrets)
+    redact_value_with_secrets(value, &secrets())
 }
 fn redact_text(input: &str, secrets: &[String]) -> String {
     let mut secrets = secrets
@@ -115,17 +166,19 @@ pub(crate) fn redacted_session(
 }
 pub(crate) fn safe_config(cfg: &crate::config::Config) -> Value {
     let mut value = serde_json::to_value(cfg).unwrap_or(Value::Null);
-    if let Some(url) = value
-        .get("base_url")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        // Credentials in an URL are never useful in `config` output.
-        if let Some(at) = url.find('@') {
-            let scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
-            if at >= scheme {
-                value["base_url"] =
-                    Value::String(format!("{}[REDACTED]{}", &url[..scheme], &url[at..]));
+    for path in ["/base_url", "/provider_profile/endpoint"] {
+        if let Some(url) = value
+            .pointer(path)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            // Credentials in an URL are never useful in `config` output.
+            if let Some(at) = url.find('@') {
+                let scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+                if at >= scheme {
+                    *value.pointer_mut(path).expect("existing config field") =
+                        Value::String(format!("{}[REDACTED]{}", &url[..scheme], &url[at..]));
+                }
             }
         }
     }
@@ -136,6 +189,17 @@ pub(crate) fn safe_config(cfg: &crate::config::Config) -> Value {
 mod redaction_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn catalog_credentials_are_redacted_from_nested_values_and_text() {
+        let key = "catalog-test-secret-87fb34";
+        register_secret(key);
+        assert_eq!(redact(key), "[REDACTED]");
+        assert_eq!(
+            redact_value(json!({"nested": [key]})).unwrap(),
+            json!({"nested": ["[REDACTED]"]})
+        );
+    }
 
     #[test]
     fn redacts_nested_values_and_object_keys_without_json_round_trip_leaks() {

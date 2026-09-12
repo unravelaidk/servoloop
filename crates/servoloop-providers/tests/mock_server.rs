@@ -45,6 +45,121 @@ use tokio::sync::Notify;
 // Mock HTTP server
 // ───────────────────────────────────────────────────────────────────
 
+#[tokio::test]
+async fn catalog_accepts_reported_4614121_byte_payload_through_fetch_and_discovery() {
+    let mut body = serde_json::to_vec(&json!({"large-catalog-fixture": {
+        "name":"Large Catalog Fixture", "npm":"@ai-sdk/openai-compatible",
+        "env":[], "models":{"fixture-model":{"name":"Fixture", "tool_call":true}}
+    }}))
+    .unwrap();
+    body.resize(4_614_121, b' ');
+    let server = MockServer::start(Box::new(move |_, path, _, _| {
+        if path == "/v1/models" {
+            MockResponse::json(200, json!({"data":[]}))
+        } else {
+            MockResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: body.clone(),
+                hold_open: None,
+            }
+        }
+    }))
+    .await;
+    let url = format!("http://{}/catalog.json", server.addr);
+    let providers = servoloop_providers::catalog::fetch_catalog(Some(&url))
+        .await
+        .unwrap();
+    assert_eq!(providers[0].id, "large-catalog-fixture");
+    let spec = ProviderSpec::custom("large-catalog-fixture", "Fixture", server.base_url(), None);
+    let options = DiscoveryOptions {
+        models_dev_url_override: Some(url),
+        ..Default::default()
+    };
+    let models = Discovery::new().discover(&spec, &options).await.unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model_id, "fixture-model");
+    assert!(!models[0].from_endpoint);
+}
+
+#[tokio::test]
+async fn catalog_still_rejects_declared_bodies_above_16_mib() {
+    let server = MockServer::start(Box::new(|_, _, _, _| MockResponse {
+        status: 200,
+        headers: vec![],
+        body: vec![b' '; 16 * 1024 * 1024 + 1],
+        hold_open: None,
+    }))
+    .await;
+    let url = format!("http://{}/catalog.json", server.addr);
+    let error = servoloop_providers::catalog::fetch_catalog(Some(&url))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("16777216 byte limit"), "{error}");
+    assert!(error.contains("declared 16777217"), "{error}");
+}
+
+#[tokio::test]
+async fn ordinary_provider_json_keeps_the_4_mib_limit() {
+    let server = MockServer::start(Box::new(|_, _, _, _| MockResponse {
+        status: 200,
+        headers: vec![],
+        body: vec![b' '; 4_614_121],
+        hold_open: None,
+    }))
+    .await;
+    let provider = OpenAiCompatProvider::new(
+        ProviderSpec::custom("bounded", "Bounded", server.base_url(), None),
+        "test",
+    )
+    .unwrap();
+    let error = provider
+        .complete(ModelRequest::new(
+            "bounded",
+            vec![Message::user_text("test")],
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("4194304 byte limit"), "{error}");
+}
+
+#[tokio::test]
+async fn catalog_stops_chunked_download_at_limit_without_waiting_for_eof() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/catalog.json", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let mut request = [0u8; 4096];
+        if socket.read(&mut request).await? == 0 {
+            return Ok(());
+        }
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").await?;
+        let chunk = vec![b' '; 64 * 1024];
+        for _ in 0..257 {
+            socket.write_all(b"10000\r\n").await?;
+            socket.write_all(&chunk).await?;
+            socket.write_all(b"\r\n").await?;
+        }
+        // Deliberately never terminate the response: the byte cap, not EOF
+        // or the HTTP timeout, must stop the download.
+        std::future::pending::<std::io::Result<()>>().await
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        servoloop_providers::catalog::fetch_catalog(Some(&url)),
+    )
+    .await;
+    server.abort();
+    let error = result
+        .expect("byte limit must stop before EOF")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("16777216 byte limit"), "{error}");
+    assert!(error.contains("received"), "{error}");
+}
+
 /// A handler function that receives (method, path, body, headers) and
 /// returns a mock response.
 type Handler =
@@ -1783,6 +1898,8 @@ async fn models_dev_catalog_merge_preserves_provenance() {
     let endpoint_models = vec!["endpoint-only".to_string(), "shared".to_string()];
 
     let catalog = vec![CatalogProvider {
+        npm: "@ai-sdk/openai".into(),
+        env: vec![],
         id: "test-provider".to_string(),
         name: "Test Provider".to_string(),
         base_url: Some("http://localhost:8080/v1".into()),
