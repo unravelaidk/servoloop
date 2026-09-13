@@ -1184,24 +1184,13 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
- "servoloop-core",
- "servoloop-providers",
  "servoloop-robot",
  "servoloop-store",
  "tempfile",
  "tokio",
+ "unravel-agent-providers",
+ "unravel-agent-runtime",
  "url",
-]
-
-[[package]]
-name = "servoloop-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
 ]
 
 [[package]]
@@ -1213,10 +1202,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "servoloop-core",
  "servoloop-robot",
  "thiserror",
  "tokio",
+ "unravel-agent-runtime",
 ]
 
 [[package]]
@@ -1224,10 +1213,10 @@ name = "servoloop-isaac-example"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "servoloop-core",
  "servoloop-isaac",
  "servoloop-robot",
  "tokio",
+ "unravel-agent-runtime",
 ]
 
 [[package]]
@@ -1235,23 +1224,9 @@ name = "servoloop-openai-compatible-demo"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "servoloop-core",
- "servoloop-providers",
  "tokio",
-]
-
-[[package]]
-name = "servoloop-providers"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "servoloop-core",
- "thiserror",
- "tokio",
+ "unravel-agent-providers",
+ "unravel-agent-runtime",
 ]
 
 [[package]]
@@ -1261,8 +1236,8 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
- "servoloop-core",
  "tokio",
+ "unravel-agent-runtime",
 ]
 
 [[package]]
@@ -1271,9 +1246,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde_json",
- "servoloop-core",
  "servoloop-robot",
  "tokio",
+ "unravel-agent-runtime",
 ]
 
 [[package]]
@@ -1282,9 +1257,9 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "servoloop-core",
  "tempfile",
  "thiserror",
+ "unravel-agent-runtime",
 ]
 
 [[package]]
@@ -1646,6 +1621,34 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+
+[[package]]
+name = "unravel-agent-providers"
+version = "0.1.0"
+source = "git+https://github.com/unravelaidk/unravel-agent-runtime?rev=f4d7701f2c4aa0bcba374d26858cf3faa23f0f91#f4d7701f2c4aa0bcba374d26858cf3faa23f0f91"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "unravel-agent-runtime",
+]
+
+[[package]]
+name = "unravel-agent-runtime"
+version = "0.1.0"
+source = "git+https://github.com/unravelaidk/unravel-agent-runtime?rev=f4d7701f2c4aa0bcba374d26858cf3faa23f0f91#f4d7701f2c4aa0bcba374d26858cf3faa23f0f91"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "untrusted"

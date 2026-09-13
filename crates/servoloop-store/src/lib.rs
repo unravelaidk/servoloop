@@ -3,7 +3,7 @@
 //! A journal intent is durable before its operation is dispatched.  An
 //! unknown outcome is never treated as success.  This crate does not replay
 //! tools and does not know how to redact secrets: callers must pass a redacted
-//! [`servoloop_core::Session`] (or redact it with their own policy) to
+//! [`unravel_agent_runtime::Session`] (or redact it with their own policy) to
 //! [`Store::save_snapshot`]. Paths are checked before use and symlinked store
 //! entries are rejected, but callers must place the root in a trusted parent:
 //! no portable filesystem API can eliminate every parent-directory TOCTOU
@@ -75,7 +75,7 @@ impl SessionGuard {
 
     /// Save a terminal session while retaining this execution lease. This is
     /// the non-locking counterpart to `Store::save_snapshot`.
-    pub fn save_snapshot(&self, session: &servoloop_core::Session) -> Result<()> {
+    pub fn save_snapshot(&self, session: &unravel_agent_runtime::Session) -> Result<()> {
         if session.id != self.session_id {
             return Err(StoreError::InvalidJournal(
                 "snapshot session does not match session lease".into(),
@@ -226,12 +226,12 @@ impl Store {
             true,
         )
     }
-    pub fn save_snapshot(&self, session: &servoloop_core::Session) -> Result<()> {
+    pub fn save_snapshot(&self, session: &unravel_agent_runtime::Session) -> Result<()> {
         let _guard = self.acquire_session(&session.id)?;
         _guard.save_snapshot(session)
     }
 
-    fn save_snapshot_locked(&self, session: &servoloop_core::Session) -> Result<()> {
+    fn save_snapshot_locked(&self, session: &unravel_agent_runtime::Session) -> Result<()> {
         Self::safe_id(&session.id)?;
         let dir = self.session_dir(&session.id)?;
         let records = self.records(&session.id)?;
@@ -242,7 +242,7 @@ impl Store {
             !journal::unresolved(&records)?.is_empty(),
         )
     }
-    pub fn load_snapshot(&self, id: &str) -> Result<servoloop_core::Session> {
+    pub fn load_snapshot(&self, id: &str) -> Result<unravel_agent_runtime::Session> {
         Self::safe_id(id)?;
         let dir = self.root.join(id);
         if !dir.is_dir() {
@@ -257,7 +257,10 @@ impl Store {
 
     /// Load a snapshot while holding the caller's execution lease. This checks
     /// the journal watermark before returning any session state.
-    pub fn load_snapshot_guarded(&self, guard: &SessionGuard) -> Result<servoloop_core::Session> {
+    pub fn load_snapshot_guarded(
+        &self,
+        guard: &SessionGuard,
+    ) -> Result<unravel_agent_runtime::Session> {
         if guard.store.root != self.root {
             return Err(StoreError::Busy);
         }
@@ -265,7 +268,11 @@ impl Store {
         self.load_snapshot_file(guard.session_id(), path)
     }
 
-    fn load_snapshot_file(&self, id: &str, path: PathBuf) -> Result<servoloop_core::Session> {
+    fn load_snapshot_file(
+        &self,
+        id: &str,
+        path: PathBuf,
+    ) -> Result<unravel_agent_runtime::Session> {
         let snapshot = snapshot::read(&path, id)?;
         let records = self.records(id)?;
         snapshot::validate(
@@ -301,7 +308,7 @@ pub fn new_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use servoloop_core::{Message, Session};
+    use unravel_agent_runtime::{Message, Session};
 
     fn store() -> (Store, PathBuf) {
         let path = std::env::temp_dir().join(new_id("store-test"));

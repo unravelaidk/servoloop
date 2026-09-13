@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use servoloop_core::{Error, Result};
 use servoloop_robot::{CommandReceipt, RobotCommand, RobotDriver, RobotState};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use unravel_agent_runtime::{Error, Result};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;

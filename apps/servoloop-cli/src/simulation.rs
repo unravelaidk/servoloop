@@ -53,9 +53,9 @@ impl Model for DemoModel {
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use servoloop_core::{Model, ModelRequest, ModelResponse, Result as CoreResult, ToolCall};
 use servoloop_robot::{CommandReceipt, RobotCommand, RobotDriver, RobotState};
 use tokio::sync::Mutex;
+use unravel_agent_runtime::{Model, ModelRequest, ModelResponse, Result as CoreResult, ToolCall};
 
 use servoloop_robot::{JointLimit, JointLimitPolicy, RobotHarness};
 use std::{collections::BTreeMap, sync::Arc};

@@ -1,7 +1,5 @@
 [workspace]
 members = [
-    "crates/servoloop-core",
-    "crates/servoloop-providers",
     "crates/servoloop-robot",
     "crates/servoloop-isaac",
     "crates/servoloop-store",
@@ -20,6 +18,8 @@ repository = "https://github.com/unravelaidk/servoloop"
 rust-version = "1.88"
 
 [workspace.dependencies]
+unravel-agent-runtime = { version = "0.1.0", git = "https://github.com/unravelaidk/unravel-agent-runtime", rev = "f4d7701f2c4aa0bcba374d26858cf3faa23f0f91" }
+unravel-agent-providers = { version = "0.1.0", git = "https://github.com/unravelaidk/unravel-agent-runtime", rev = "f4d7701f2c4aa0bcba374d26858cf3faa23f0f91" }
 clap = { version = "4.5", features = ["derive"] }
 async-trait = "0.1"
 futures-util = "0.3"

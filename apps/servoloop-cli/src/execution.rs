@@ -7,11 +7,13 @@ use crate::{
     simulation::{harness, DemoModel},
 };
 use serde_json::json;
-use servoloop_core::{AgentLoop, Event as AgentEvent, LoopConfig, Model, StopToken, ToolRegistry};
-use servoloop_providers::{OpenAiCompatProvider, Secret};
 use servoloop_store::{new_id, JournalRecord, SessionGuard, SCHEMA_VERSION};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
+use unravel_agent_providers::{ChatOptions, OpenAiCompatProvider, Secret};
+use unravel_agent_runtime::{
+    AgentLoop, Event as AgentEvent, LoopConfig, Model, StopToken, ToolRegistry,
+};
 
 pub(crate) const DEMO_PROMPT: &str = "Move the shoulder to 0.2 radians.";
 
@@ -127,9 +129,20 @@ fn model_with_key(
         key,
     )?;
     spec.validate().map_err(|e| format!("provider: {e}"))?;
-    Ok(Arc::new(
-        OpenAiCompatProvider::new(spec, model_name).map_err(|e| e.to_string())?,
-    ))
+    let mut options = ChatOptions::default();
+    if spec.id == "openrouter" {
+        options.headers.insert(
+            "http-referer",
+            "https://github.com/unravelaidk/servoloop"
+                .parse()
+                .expect("static header"),
+        );
+        options
+            .headers
+            .insert("x-title", "ServoLoop".parse().expect("static header"));
+    }
+    let provider = OpenAiCompatProvider::new(spec, model_name).map_err(|e| e.to_string())?;
+    Ok(Arc::new(provider.with_chat_options(options)))
 }
 
 pub(crate) async fn resume(args: &[String], cfg: &Config) -> Result<i32, String> {
@@ -207,7 +220,7 @@ async fn run_loop(
     model: Arc<dyn Model>,
     prompt: String,
     simulated: bool,
-    restored: Option<(String, Arc<SessionGuard>, servoloop_core::Session)>,
+    restored: Option<(String, Arc<SessionGuard>, unravel_agent_runtime::Session)>,
     control: RunControl,
 ) -> Result<i32, String> {
     control.output.starting(simulated);
@@ -222,7 +235,11 @@ async fn run_loop(
             }
             st.create_session(&sid).map_err(|e| e.to_string())?;
             let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
-            (sid.clone(), guard, servoloop_core::Session::new(&sid))
+            (
+                sid.clone(),
+                guard,
+                unravel_agent_runtime::Session::new(&sid),
+            )
         }
     };
     let mut seq = 0;
@@ -289,12 +306,12 @@ async fn run_loop(
     if session
         .messages
         .iter()
-        .any(|m| matches!(m, servoloop_core::Message::ToolUnknown { .. }))
+        .any(|m| matches!(m, unravel_agent_runtime::Message::ToolUnknown { .. }))
     {
         return Err("session has unresolved ToolUnknown results; refusing to resume".into());
     }
     if !session.messages.is_empty() && is_restored {
-        session.messages.push(servoloop_core::Message::System {
+        session.messages.push(unravel_agent_runtime::Message::System {
             content: "Resume disclaimer: this is a fresh simulated environment. Prior robot observations are historical and are not current state; do not replay prior movement.".into(),
         });
     }
@@ -411,15 +428,15 @@ mod cancellation_tests {
     use crate::simulation::SimulatedDriver;
     use async_trait::async_trait;
     use serde_json::Value;
-    use servoloop_core::EventSink;
-    use servoloop_core::{
-        ModelRequest, ModelResponse, Result as CoreResult, Tool, ToolCall, ToolOutput,
-    };
     use servoloop_robot::{JointLimitPolicy, RobotHarness, RobotState};
     use servoloop_store::Store;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Notify;
+    use unravel_agent_runtime::EventSink;
+    use unravel_agent_runtime::{
+        ModelRequest, ModelResponse, Result as CoreResult, Tool, ToolCall, ToolOutput,
+    };
 
     struct Events(StdMutex<Vec<AgentEvent>>);
     impl EventSink for Events {
@@ -450,8 +467,8 @@ mod cancellation_tests {
     }
     #[async_trait]
     impl Tool for ReadyThenHang {
-        fn definition(&self) -> servoloop_core::ToolDefinition {
-            servoloop_core::ToolDefinition {
+        fn definition(&self) -> unravel_agent_runtime::ToolDefinition {
+            unravel_agent_runtime::ToolDefinition {
                 name: "robot_command".into(),
                 description: "test".into(),
                 parameters: json!({"type":"object"}),
@@ -501,7 +518,7 @@ mod cancellation_tests {
         let stop_for_run = stop.clone();
         let events_for_run = events.clone();
         let task = tokio::spawn(async move {
-            let mut session = servoloop_core::Session::new(sid);
+            let mut session = unravel_agent_runtime::Session::new(sid);
             let result = agent
                 .run(&mut session, "move", events_for_run.as_ref(), &stop_for_run)
                 .await;
@@ -510,7 +527,7 @@ mod cancellation_tests {
         ready.notified().await;
         stop.stop();
         let (result, session) = task.await.unwrap();
-        assert!(matches!(result, Err(servoloop_core::Error::Stopped)));
+        assert!(matches!(result, Err(unravel_agent_runtime::Error::Stopped)));
         assert!(!events
             .0
             .lock()

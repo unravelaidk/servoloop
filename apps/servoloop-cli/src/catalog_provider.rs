@@ -1,6 +1,6 @@
 //! Persisted catalog connection metadata. Contains references, never secrets.
 use serde::{Deserialize, Serialize};
-use servoloop_providers::{CatalogProvider, KeyPolicy, ProviderSpec, Secret};
+use unravel_agent_providers::{CatalogProvider, KeyPolicy, ProviderSpec, Secret};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

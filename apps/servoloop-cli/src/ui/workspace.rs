@@ -7,16 +7,16 @@ use crate::{
     config::{store, store_path, Config},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use servoloop_providers::{
-    CatalogProvider, DiscoveredModel, Discovery, DiscoveryOptions, ProviderSpec, Secret,
-    ToolSupport,
-};
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
+use unravel_agent_providers::{
+    CatalogProvider, DiscoveredModel, Discovery, DiscoveryOptions, ProviderSpec, Secret,
+    ToolSupport,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Page {
@@ -880,7 +880,7 @@ impl Workspace {
         self.job = Some(tokio::spawn(async {
             tokio::time::timeout(
                 Duration::from_secs(15),
-                servoloop_providers::catalog::fetch_catalog(None),
+                unravel_agent_providers::catalog::fetch_catalog(None),
             )
             .await
             .map_err(|_| "Provider catalog timed out. Press F5 to retry.".to_string())?
@@ -1018,7 +1018,7 @@ mod tests {
             model: Some("local-test".into()),
             ..Config::default()
         });
-        workspace.providers = servoloop_providers::catalog::parse_catalog(&serde_json::json!({
+        workspace.providers = unravel_agent_providers::catalog::parse_catalog(&serde_json::json!({
             "openrouter": {"name":"OpenRouter", "npm":"@ai-sdk/openai-compatible", "api":"https://catalog.example/v1", "env":[], "models":{"test":{"name":"Test"}}},
             "ollama": {"name":"Ollama", "npm":"@ai-sdk/openai-compatible", "api":"http://localhost:11434/v1", "env":[], "models":{"test":{"name":"Test"}}},
             "new-catalog-provider": {"name":"New Catalog Provider", "npm":"@ai-sdk/openai-compatible", "api":"https://catalog.example/v1", "env":[], "models":{"test":{"name":"Test"}}},
@@ -1155,7 +1155,7 @@ mod tests {
         let fixture = Fixture::new();
         let st = servoloop_store::Store::open(&fixture.0).unwrap();
         st.create_session("saved").unwrap();
-        st.save_snapshot(&servoloop_core::Session::new("saved"))
+        st.save_snapshot(&unravel_agent_runtime::Session::new("saved"))
             .unwrap();
         let mut w = workspace();
         w.open(Page::Sessions, &fixture.args());

@@ -7,9 +7,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
-use servoloop_core::{Error, Result, Tool, ToolDefinition, ToolOutput, ToolRegistry};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch, Mutex};
+use unravel_agent_runtime::{Error, Result, Tool, ToolDefinition, ToolOutput, ToolRegistry};
+
+fn safety_error(message: String) -> Error {
+    Error::Policy(format!("safety violation: {message}"))
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RobotState {
@@ -137,34 +141,34 @@ impl SafetyPolicy for JointLimitPolicy {
                 || limit.min > limit.max
                 || limit.max_step < 0.0
             {
-                return Err(Error::Safety(format!("invalid limits for joint `{joint}`")));
+                return Err(safety_error(format!("invalid limits for joint `{joint}`")));
             }
         }
         if let Some(minimum) = self.minimum_battery_percent {
             if !minimum.is_finite() || !(0.0..=100.0).contains(&minimum) {
-                return Err(Error::Safety("minimum battery threshold is invalid".into()));
+                return Err(safety_error("minimum battery threshold is invalid".into()));
             }
             let actual = state
                 .battery_percent
-                .ok_or_else(|| Error::Safety("battery reading is missing".into()))?;
+                .ok_or_else(|| safety_error("battery reading is missing".into()))?;
             if !actual.is_finite() || !(0.0..=100.0).contains(&actual) {
-                return Err(Error::Safety("battery reading is invalid".into()));
+                return Err(safety_error("battery reading is invalid".into()));
             }
             if actual < minimum && !matches!(command, RobotCommand::Stop) {
-                return Err(Error::Safety(format!(
+                return Err(safety_error(format!(
                     "battery is {actual:.1}%, below the {minimum:.1}% minimum"
                 )));
             }
         } else if let Some(actual) = state.battery_percent {
             if !actual.is_finite() || !(0.0..=100.0).contains(&actual) {
-                return Err(Error::Safety("battery reading is invalid".into()));
+                return Err(safety_error("battery reading is invalid".into()));
             }
         }
         if state.joints.values().any(|v| !v.is_finite()) {
-            return Err(Error::Safety("observed joint position is invalid".into()));
+            return Err(safety_error("observed joint position is invalid".into()));
         }
         if state.emergency_stop && !matches!(command, RobotCommand::Stop) {
-            return Err(Error::Safety("the robot reports an emergency stop".into()));
+            return Err(safety_error("the robot reports an emergency stop".into()));
         }
         match command {
             RobotCommand::MoveJoint { joint, position } => {
@@ -172,7 +176,7 @@ impl SafetyPolicy for JointLimitPolicy {
             }
             RobotCommand::MoveJoints { positions } => {
                 if positions.is_empty() {
-                    return Err(Error::Safety(
+                    return Err(safety_error(
                         "move_joints requires at least one joint".into(),
                     ));
                 }
@@ -181,7 +185,7 @@ impl SafetyPolicy for JointLimitPolicy {
                 }
                 Ok(())
             }
-            RobotCommand::SetOutput { .. } => Err(Error::Safety(
+            RobotCommand::SetOutput { .. } => Err(safety_error(
                 "output channels are not authorized by the joint-only policy".into(),
             )),
             RobotCommand::Stop => Ok(()),
@@ -191,16 +195,16 @@ impl SafetyPolicy for JointLimitPolicy {
 impl JointLimitPolicy {
     fn validate_joint(&self, joint: &str, target: f64, state: &RobotState) -> Result<()> {
         if !target.is_finite() {
-            return Err(Error::Safety(format!(
+            return Err(safety_error(format!(
                 "joint `{joint}` target must be finite"
             )));
         }
         let limit = self
             .limits
             .get(joint)
-            .ok_or_else(|| Error::Safety(format!("joint `{joint}` is not configured")))?;
+            .ok_or_else(|| safety_error(format!("joint `{joint}` is not configured")))?;
         if !(limit.min..=limit.max).contains(&target) {
-            return Err(Error::Safety(format!(
+            return Err(safety_error(format!(
                 "joint `{joint}` target {target} is outside [{}, {}]",
                 limit.min, limit.max
             )));
@@ -208,9 +212,9 @@ impl JointLimitPolicy {
         let current = state
             .joints
             .get(joint)
-            .ok_or_else(|| Error::Safety(format!("joint `{joint}` has no observed position")))?;
+            .ok_or_else(|| safety_error(format!("joint `{joint}` has no observed position")))?;
         if (target - current).abs() > limit.max_step {
-            return Err(Error::Safety(format!(
+            return Err(safety_error(format!(
                 "joint `{joint}` move exceeds the maximum step of {}",
                 limit.max_step
             )));
@@ -373,7 +377,7 @@ impl RobotHarness {
         {
             let l = self.coordinator.lifecycle.lock().await;
             if !l.stop_acknowledged {
-                return Err(Error::Safety(
+                return Err(safety_error(
                     "robot has not completed an acknowledged stop".into(),
                 ));
             }
@@ -381,11 +385,11 @@ impl RobotHarness {
         let state = self.observe_bounded().await?;
         self.policy.validate(&RobotCommand::Stop, &state)?;
         if state.emergency_stop {
-            return Err(Error::Safety("driver still reports emergency stop".into()));
+            return Err(safety_error("driver still reports emergency stop".into()));
         }
         let mut l = self.coordinator.lifecycle.lock().await;
         if !l.stop_acknowledged || *self.coordinator.stop_generation.borrow() != reset_generation {
-            return Err(Error::Safety("stop state changed during reset".into()));
+            return Err(safety_error("stop state changed during reset".into()));
         }
         l.stop_acknowledged = false;
         l.stop_requested = false;
@@ -443,23 +447,23 @@ impl RobotHarness {
             _ = &mut cancel => return Err(Error::Stopped),
             result = stop.changed() => {
                 if result.is_ok() { return Err(Error::Stopped); }
-                return Err(Error::Safety("stop coordinator closed".into()));
+                return Err(safety_error("stop coordinator closed".into()));
             }
         };
         {
             let l = self.coordinator.lifecycle.lock().await;
             if let Some(f) = &l.fault {
-                return Err(Error::Safety(format!("robot is faulted: {f}")));
+                return Err(safety_error(format!("robot is faulted: {f}")));
             }
             if l.stop_requested || l.stop_acknowledged {
-                return Err(Error::Safety("ServoLoop emergency stop is engaged".into()));
+                return Err(safety_error("ServoLoop emergency stop is engaged".into()));
             }
         }
         let state = match tokio::select! {
             biased;
             result = self.observe_bounded() => result,
             _ = &mut cancel => { self.cleanup_fault("command cancelled before observation".into()).await; return Err(Error::Stopped); },
-            result = stop.changed() => { if result.is_ok() { return Err(Error::Stopped); } return Err(Error::Safety("stop coordinator closed".into())); }
+            result = stop.changed() => { if result.is_ok() { return Err(Error::Stopped); } return Err(safety_error("stop coordinator closed".into())); }
         } {
             Ok(state) => state,
             Err(error) => {
@@ -469,7 +473,7 @@ impl RobotHarness {
             }
         };
         if !self.tolerance.is_finite() || self.tolerance < 0.0 {
-            return Err(Error::Safety("postcondition tolerance is invalid".into()));
+            return Err(safety_error("postcondition tolerance is invalid".into()));
         }
         self.policy.validate(&command, &state)?;
         if *self.coordinator.stop_generation.borrow() != generation {
@@ -567,7 +571,7 @@ impl RobotHarness {
 }
 fn verify_target(command: &RobotCommand, state: &RobotState, tolerance: f64) -> Result<()> {
     if !tolerance.is_finite() || tolerance < 0.0 {
-        return Err(Error::Safety("postcondition tolerance is invalid".into()));
+        return Err(safety_error("postcondition tolerance is invalid".into()));
     }
     let targets: Box<dyn Iterator<Item = (&String, &f64)> + '_> = match command {
         RobotCommand::MoveJoint { joint, position } => Box::new(std::iter::once((joint, position))),
@@ -578,9 +582,9 @@ fn verify_target(command: &RobotCommand, state: &RobotState, tolerance: f64) -> 
         let actual = state
             .joints
             .get(joint)
-            .ok_or_else(|| Error::Safety(format!("post-action joint `{joint}` is missing")))?;
+            .ok_or_else(|| safety_error(format!("post-action joint `{joint}` is missing")))?;
         if !actual.is_finite() || (actual - target).abs() > tolerance {
-            return Err(Error::Safety(format!(
+            return Err(safety_error(format!(
                 "post-action joint `{joint}` does not match target"
             )));
         }
@@ -637,15 +641,15 @@ impl Tool for RobotCommandTool {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use servoloop_core::{
-        AgentLoop, FinishReason, Model, ModelRequest, ModelResponse, NoopEventSink, Session,
-        StopToken, ToolCall,
-    };
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     };
     use tokio::sync::Notify;
+    use unravel_agent_runtime::{
+        AgentLoop, FinishReason, Model, ModelRequest, ModelResponse, NoopEventSink, Session,
+        StopToken, ToolCall,
+    };
     struct Fake(Mutex<RobotState>);
     #[async_trait]
     impl RobotDriver for Fake {
@@ -706,7 +710,7 @@ mod tests {
                     position: 0.5
                 })
                 .await,
-            Err(Error::Safety(_))
+            Err(Error::Policy(_))
         ));
     }
     #[tokio::test]
@@ -993,7 +997,7 @@ mod tests {
     async fn public_tool_active_drop_stops_and_agent_loop_does_not_reenter() {
         let driver = ControlledDriver::new();
         let harness = controlled_harness(driver.clone());
-        let mut tools = servoloop_core::ToolRegistry::new();
+        let mut tools = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut tools).unwrap();
         let model = Arc::new(ScriptedModel {
             response: Mutex::new(Some(two_move_response())),
@@ -1030,7 +1034,7 @@ mod tests {
         });
         driver.stop_started.notified().await;
 
-        let mut registry = servoloop_core::ToolRegistry::new();
+        let mut registry = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut registry).unwrap();
         let tool = registry.get("robot_command").unwrap();
         let result = tool
@@ -1065,7 +1069,7 @@ mod tests {
     async fn invalid_tolerance_is_rejected_before_execute() {
         let driver = ControlledDriver::new();
         let harness = controlled_harness(driver.clone()).with_postcondition_tolerance(f64::NAN);
-        let mut registry = servoloop_core::ToolRegistry::new();
+        let mut registry = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut registry).unwrap();
         let tool = registry.get("robot_command").unwrap();
         driver.release_observe.notify_one();
@@ -1074,7 +1078,7 @@ mod tests {
                 "command": "move_joint", "joint": "shoulder", "position": 0.1
             }))
             .await;
-        assert!(matches!(result, Err(Error::Safety(_))));
+        assert!(matches!(result, Err(Error::Policy(_))));
         assert!(driver.calls.lock().unwrap().is_empty());
     }
 
@@ -1082,7 +1086,7 @@ mod tests {
     async fn stop_during_blocked_observe_cannot_execute() {
         let driver = ControlledDriver::new();
         let harness = controlled_harness(driver.clone());
-        let mut registry = servoloop_core::ToolRegistry::new();
+        let mut registry = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut registry).unwrap();
         let tool = registry.get("robot_command").unwrap();
         let command = tokio::spawn(async move {
@@ -1103,7 +1107,7 @@ mod tests {
         let driver = ControlledDriver::new();
         let harness =
             controlled_harness(driver.clone()).with_observe_timeout(Duration::from_secs(5));
-        let mut registry = servoloop_core::ToolRegistry::new();
+        let mut registry = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut registry).unwrap();
         let tool = registry.get("robot_command").unwrap();
         let command = tokio::spawn(async move {
@@ -1128,7 +1132,7 @@ mod tests {
         assert!(matches!(harness.status().await, RobotStatus::Fault(_)));
         assert!(matches!(
             harness.reset_emergency_stop().await,
-            Err(Error::Safety(_))
+            Err(Error::Policy(_))
         ));
     }
 
@@ -1136,7 +1140,7 @@ mod tests {
     async fn reset_and_cleanup_complete_without_lock_deadlock() {
         let driver = ControlledDriver::new();
         let harness = controlled_harness(driver.clone());
-        let mut registry = servoloop_core::ToolRegistry::new();
+        let mut registry = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut registry).unwrap();
         let tool = registry.get("robot_command").unwrap();
         let command = tokio::spawn(async move {
@@ -1159,7 +1163,7 @@ mod tests {
     async fn concurrent_registered_tools_take_fresh_serial_observations() {
         let driver = ControlledDriver::new();
         let harness = controlled_harness(driver.clone());
-        let mut registry = servoloop_core::ToolRegistry::new();
+        let mut registry = unravel_agent_runtime::ToolRegistry::new();
         harness.register_tools(&mut registry).unwrap();
         let first = registry.get("robot_command").unwrap();
         let second = registry.get("robot_command").unwrap();

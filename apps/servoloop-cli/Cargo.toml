@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-servoloop-core = { path = "../../crates/servoloop-core" }
-servoloop-providers = { path = "../../crates/servoloop-providers" }
+unravel-agent-runtime.workspace = true
+unravel-agent-providers.workspace = true
 servoloop-store = { path = "../../crates/servoloop-store" }
 servoloop-robot = { path = "../../crates/servoloop-robot" }
 serde.workspace = true

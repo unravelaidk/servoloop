@@ -23,7 +23,7 @@ pub(crate) fn configured_provider_with_key(
     name: &str,
     base: Option<String>,
     cfg: &Config,
-    key: Option<servoloop_providers::Secret>,
+    key: Option<unravel_agent_providers::Secret>,
 ) -> Result<ProviderSpec, String> {
     if let Some(key) = &key {
         crate::output::register_secret(key.as_str());
@@ -124,8 +124,8 @@ use crate::{
     output::{print_value, safe_config},
 };
 use serde_json::json;
-use servoloop_providers::{Discovery, DiscoveryOptions, ProviderSpec};
 use std::{env, process::ExitCode};
+use unravel_agent_providers::{Discovery, DiscoveryOptions, ProviderSpec};
 
 pub(crate) fn providers() -> ExitCode {
     println!(

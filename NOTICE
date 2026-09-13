@@ -1,7 +1,18 @@
-# NOTICE — servoloop-providers
+ServoLoop third-party notices
+
+ServoLoop links unravel-agent-runtime and unravel-agent-providers from
+https://github.com/unravelaidk/unravel-agent-runtime under AGPL-3.0-only.
+Their source revision is pinned in Cargo.toml and Cargo.lock. The original
+provider attribution is retained below for binary distributions.
+
+# NOTICE — unravel-agent-providers
 
 This crate adapts patterns from the Khadim project (`arvel-ai-core`),
 which is licensed under the GNU Affero General Public License v3.0.
+
+The shared implementation was extracted from ServoLoop's `servoloop-providers`
+crate (https://github.com/unravelaidk/servoloop). The original attribution and
+modification history below are retained.
 
 ## Source
 
@@ -34,3 +45,9 @@ contracts (`servoloop-core::model::Model`, `Message`, `ToolCall`,
 - `ProviderSpec` typed protocol/endpoint/env/keyless-policy selection.
 - Credential redaction in all error paths.
 - reqwest with rustls, no redirects, bounded response/SSE limits.
+
+The extraction renamed the public runtime and provider crates to
+`unravel-agent-runtime` and `unravel-agent-providers`. The shared Chat Completions
+transport now also supports application-owned headers and raw argument strings,
+while canonical model calls retain strict validation. Application branding and
+legacy argument repair remain in the consumers.
