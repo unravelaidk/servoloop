@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-servoloop-core = { path = "../../crates/servoloop-core" }
+unravel-agent-runtime.workspace = true
 servoloop-isaac = { path = "../../crates/servoloop-isaac" }
 servoloop-robot = { path = "../../crates/servoloop-robot" }
 serde_json.workspace = true

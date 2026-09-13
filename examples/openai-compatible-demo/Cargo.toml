@@ -1,6 +1,6 @@
 [package]
 name = "servoloop-openai-compatible-demo"
-description = "Live model demo for the servoloop-providers OpenAI-compatible adapter"
+description = "Live model demo for the shared Unravel OpenAI-compatible adapter"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -8,6 +8,6 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-servoloop-core = { path = "../../crates/servoloop-core" }
-servoloop-providers = { path = "../../crates/servoloop-providers" }
+unravel-agent-runtime.workspace = true
+unravel-agent-providers.workspace = true
 tokio.workspace = true

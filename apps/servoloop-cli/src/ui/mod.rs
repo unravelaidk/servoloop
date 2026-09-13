@@ -16,7 +16,6 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use servoloop_core::StopToken;
 use state::{Phase, Report, UiOutput};
 use std::{
     env,
@@ -25,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
+use unravel_agent_runtime::StopToken;
 use view::{Theme, View};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
