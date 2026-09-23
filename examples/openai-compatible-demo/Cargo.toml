@@ -8,6 +8,6 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-servoloop-core = { path = "../../crates/servoloop-core" }
-servoloop-providers = { path = "../../crates/servoloop-providers" }
+servoloop-core = { package = "unravel-agent-runtime", version = "=0.1.1" }
+servoloop-providers = { package = "unravel-agent-providers", version = "=0.1.1" }
 tokio.workspace = true

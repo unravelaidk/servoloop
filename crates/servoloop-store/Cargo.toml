@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-servoloop-core = { path = "../servoloop-core" }
+servoloop-core = { package = "unravel-agent-runtime", version = "=0.1.1" }
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3.27"

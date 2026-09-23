@@ -11,6 +11,12 @@ use servoloop_core::{Error, Result, Tool, ToolDefinition, ToolOutput, ToolRegist
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch, Mutex};
 
+// Robot-specific rejections are represented as tool failures at the shared
+// runtime boundary. Keep their safety classification in the diagnostic text.
+fn safety(message: String) -> Error {
+    Error::Tool(format!("safety violation: {message}"))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RobotState {
     pub joints: BTreeMap<String, f64>,
@@ -137,34 +143,34 @@ impl SafetyPolicy for JointLimitPolicy {
                 || limit.min > limit.max
                 || limit.max_step < 0.0
             {
-                return Err(Error::Safety(format!("invalid limits for joint `{joint}`")));
+                return Err(safety(format!("invalid limits for joint `{joint}`")));
             }
         }
         if let Some(minimum) = self.minimum_battery_percent {
             if !minimum.is_finite() || !(0.0..=100.0).contains(&minimum) {
-                return Err(Error::Safety("minimum battery threshold is invalid".into()));
+                return Err(safety("minimum battery threshold is invalid".into()));
             }
             let actual = state
                 .battery_percent
-                .ok_or_else(|| Error::Safety("battery reading is missing".into()))?;
+                .ok_or_else(|| safety("battery reading is missing".into()))?;
             if !actual.is_finite() || !(0.0..=100.0).contains(&actual) {
-                return Err(Error::Safety("battery reading is invalid".into()));
+                return Err(safety("battery reading is invalid".into()));
             }
             if actual < minimum && !matches!(command, RobotCommand::Stop) {
-                return Err(Error::Safety(format!(
+                return Err(safety(format!(
                     "battery is {actual:.1}%, below the {minimum:.1}% minimum"
                 )));
             }
         } else if let Some(actual) = state.battery_percent {
             if !actual.is_finite() || !(0.0..=100.0).contains(&actual) {
-                return Err(Error::Safety("battery reading is invalid".into()));
+                return Err(safety("battery reading is invalid".into()));
             }
         }
         if state.joints.values().any(|v| !v.is_finite()) {
-            return Err(Error::Safety("observed joint position is invalid".into()));
+            return Err(safety("observed joint position is invalid".into()));
         }
         if state.emergency_stop && !matches!(command, RobotCommand::Stop) {
-            return Err(Error::Safety("the robot reports an emergency stop".into()));
+            return Err(safety("the robot reports an emergency stop".into()));
         }
         match command {
             RobotCommand::MoveJoint { joint, position } => {
@@ -172,16 +178,14 @@ impl SafetyPolicy for JointLimitPolicy {
             }
             RobotCommand::MoveJoints { positions } => {
                 if positions.is_empty() {
-                    return Err(Error::Safety(
-                        "move_joints requires at least one joint".into(),
-                    ));
+                    return Err(safety("move_joints requires at least one joint".into()));
                 }
                 for (joint, position) in positions {
                     self.validate_joint(joint, *position, state)?;
                 }
                 Ok(())
             }
-            RobotCommand::SetOutput { .. } => Err(Error::Safety(
+            RobotCommand::SetOutput { .. } => Err(safety(
                 "output channels are not authorized by the joint-only policy".into(),
             )),
             RobotCommand::Stop => Ok(()),
@@ -191,16 +195,14 @@ impl SafetyPolicy for JointLimitPolicy {
 impl JointLimitPolicy {
     fn validate_joint(&self, joint: &str, target: f64, state: &RobotState) -> Result<()> {
         if !target.is_finite() {
-            return Err(Error::Safety(format!(
-                "joint `{joint}` target must be finite"
-            )));
+            return Err(safety(format!("joint `{joint}` target must be finite")));
         }
         let limit = self
             .limits
             .get(joint)
-            .ok_or_else(|| Error::Safety(format!("joint `{joint}` is not configured")))?;
+            .ok_or_else(|| safety(format!("joint `{joint}` is not configured")))?;
         if !(limit.min..=limit.max).contains(&target) {
-            return Err(Error::Safety(format!(
+            return Err(safety(format!(
                 "joint `{joint}` target {target} is outside [{}, {}]",
                 limit.min, limit.max
             )));
@@ -208,9 +210,9 @@ impl JointLimitPolicy {
         let current = state
             .joints
             .get(joint)
-            .ok_or_else(|| Error::Safety(format!("joint `{joint}` has no observed position")))?;
+            .ok_or_else(|| safety(format!("joint `{joint}` has no observed position")))?;
         if (target - current).abs() > limit.max_step {
-            return Err(Error::Safety(format!(
+            return Err(safety(format!(
                 "joint `{joint}` move exceeds the maximum step of {}",
                 limit.max_step
             )));
@@ -365,7 +367,7 @@ impl RobotHarness {
         {
             let l = self.coordinator.lifecycle.lock().await;
             if !l.stop_acknowledged {
-                return Err(Error::Safety(
+                return Err(safety(
                     "robot has not completed an acknowledged stop".into(),
                 ));
             }
@@ -373,11 +375,11 @@ impl RobotHarness {
         let state = self.observe_bounded().await?;
         self.policy.validate(&RobotCommand::Stop, &state)?;
         if state.emergency_stop {
-            return Err(Error::Safety("driver still reports emergency stop".into()));
+            return Err(safety("driver still reports emergency stop".into()));
         }
         let mut l = self.coordinator.lifecycle.lock().await;
         if !l.stop_acknowledged || *self.coordinator.stop_generation.borrow() != reset_generation {
-            return Err(Error::Safety("stop state changed during reset".into()));
+            return Err(safety("stop state changed during reset".into()));
         }
         l.stop_acknowledged = false;
         l.stop_requested = false;
@@ -433,23 +435,23 @@ impl RobotHarness {
             _ = &mut cancel => return Err(Error::Stopped),
             result = stop.changed() => {
                 if result.is_ok() { return Err(Error::Stopped); }
-                return Err(Error::Safety("stop coordinator closed".into()));
+                return Err(safety("stop coordinator closed".into()));
             }
         };
         {
             let l = self.coordinator.lifecycle.lock().await;
             if let Some(f) = &l.fault {
-                return Err(Error::Safety(format!("robot is faulted: {f}")));
+                return Err(safety(format!("robot is faulted: {f}")));
             }
             if l.stop_requested || l.stop_acknowledged {
-                return Err(Error::Safety("ServoLoop emergency stop is engaged".into()));
+                return Err(safety("ServoLoop emergency stop is engaged".into()));
             }
         }
         let state = match tokio::select! {
             biased;
             result = self.observe_bounded() => result,
             _ = &mut cancel => { self.cleanup_fault("command cancelled before observation".into()).await; return Err(Error::Stopped); },
-            result = stop.changed() => { if result.is_ok() { return Err(Error::Stopped); } return Err(Error::Safety("stop coordinator closed".into())); }
+            result = stop.changed() => { if result.is_ok() { return Err(Error::Stopped); } return Err(safety("stop coordinator closed".into())); }
         } {
             Ok(state) => state,
             Err(error) => {
@@ -459,7 +461,7 @@ impl RobotHarness {
             }
         };
         if !self.tolerance.is_finite() || self.tolerance < 0.0 {
-            return Err(Error::Safety("postcondition tolerance is invalid".into()));
+            return Err(safety("postcondition tolerance is invalid".into()));
         }
         self.policy.validate(&command, &state)?;
         if *self.coordinator.stop_generation.borrow() != generation {
@@ -538,7 +540,7 @@ impl RobotHarness {
 }
 fn verify_target(command: &RobotCommand, state: &RobotState, tolerance: f64) -> Result<()> {
     if !tolerance.is_finite() || tolerance < 0.0 {
-        return Err(Error::Safety("postcondition tolerance is invalid".into()));
+        return Err(safety("postcondition tolerance is invalid".into()));
     }
     let targets: Box<dyn Iterator<Item = (&String, &f64)> + '_> = match command {
         RobotCommand::MoveJoint { joint, position } => Box::new(std::iter::once((joint, position))),
@@ -549,9 +551,9 @@ fn verify_target(command: &RobotCommand, state: &RobotState, tolerance: f64) -> 
         let actual = state
             .joints
             .get(joint)
-            .ok_or_else(|| Error::Safety(format!("post-action joint `{joint}` is missing")))?;
+            .ok_or_else(|| safety(format!("post-action joint `{joint}` is missing")))?;
         if !actual.is_finite() || (actual - target).abs() > tolerance {
-            return Err(Error::Safety(format!(
+            return Err(safety(format!(
                 "post-action joint `{joint}` does not match target"
             )));
         }
@@ -677,7 +679,7 @@ mod tests {
                     position: 0.5
                 })
                 .await,
-            Err(Error::Safety(_))
+            Err(Error::Tool(message)) if message.starts_with("safety violation: ")
         ));
     }
     #[tokio::test]
@@ -1033,7 +1035,9 @@ mod tests {
                 "command": "move_joint", "joint": "shoulder", "position": 0.1
             }))
             .await;
-        assert!(matches!(result, Err(Error::Safety(_))));
+        assert!(
+            matches!(result, Err(Error::Tool(message)) if message.starts_with("safety violation: "))
+        );
         assert!(driver.calls.lock().unwrap().is_empty());
     }
 
@@ -1087,7 +1091,7 @@ mod tests {
         assert!(matches!(harness.status().await, RobotStatus::Fault(_)));
         assert!(matches!(
             harness.reset_emergency_stop().await,
-            Err(Error::Safety(_))
+            Err(Error::Tool(message)) if message.starts_with("safety violation: ")
         ));
     }
 

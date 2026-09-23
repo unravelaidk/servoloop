@@ -37,12 +37,19 @@ adapts them for embodied systems:
 
 ## Repository layout
 
-The workspace separates the generic agent runtime from robot-specific code:
+ServoLoop uses the published `unravel-agent-runtime` and
+`unravel-agent-providers` Rust crates (version 0.1.1) for model execution and
+provider discovery. Cargo aliases retain the `servoloop_core` and
+`servoloop_providers` import paths in the application. The original local
+runtime and provider crates remain in the workspace, but the CLI, robot,
+store, and examples use the published crates.
 
-- `crates/servoloop-core` contains the agent loop, model trait, tools, sessions,
-  events, retries, and stop token.
+The remaining workspace separates robot-specific code from the shared runtime:
+
 - `crates/servoloop-robot` contains robot drivers, commands, state, safety
   policies, and agent-facing robot tools.
+- `crates/servoloop-store` contains session snapshots and the command journal.
+- `apps/servoloop-cli` contains the operator CLI and terminal interface.
 - `examples/simulated-arm` demonstrates an observe-act-observe loop without
   physical hardware.
 
@@ -56,6 +63,55 @@ cargo run -p servoloop-simulated-arm
 
 The example emits newline-delimited JSON events, executes a safety-checked
 joint command, and prints the final model response.
+
+## Use the terminal interface
+
+Start the Ratatui interface from an interactive terminal:
+
+```bash
+cargo run --locked -p servoloop-cli
+```
+
+The interface opens only when both standard input and standard output are
+terminals. Explicit commands such as `run`, `resume`, and `models` keep their
+existing machine-readable output; redirected bare invocation still prints usage.
+
+Choose **Try offline demo** to enter a conversation without credentials.
+Opening the demo does not run a command. Type a request or press **Tab** to
+fill a suggested observation, then press **Enter** to submit it. The offline
+provider supports a limited set of simulated-shoulder tasks, not general
+natural-language planning. Configure a real provider for other model requests;
+the robot driver remains simulated in either mode.
+
+The terminal interface keeps the simulator and conversation between messages.
+Opening a saved session restores conversation history into an idle composer,
+not robot state. It does not replay tools or automatically observe the simulator.
+Unknown outcomes and unresolved storage failures block further execution.
+
+Use these keyboard controls:
+
+| Control | Action |
+| --- | --- |
+| Enter | Submit a draft, or choose the selected menu item. |
+| Shift+Enter or Ctrl+J | Insert a newline; Ctrl+J works when the terminal cannot distinguish Shift+Enter. |
+| Paste | Insert text without submitting it. |
+| Left, Right, Home, End | Move within the draft. |
+| PageUp, PageDown | Read conversation history or return toward live output. |
+| `/` in an empty composer, or Ctrl+K | Open the command palette. |
+| Esc | Close a view and retain the draft. |
+| Ctrl+C during a run | Request cancellation and wait for cleanup. |
+| Ctrl+Q | Quit after cancellation and cleanup, if a run is active. |
+
+The palette provides model settings, saved sessions, execution inspection,
+new sessions, help, and update information. In settings, **Tab** selects a
+field, **Ctrl+T** tests the model endpoint without robot tools, **Ctrl+D**
+discovers models, **Enter** applies pending settings to the next run, and
+**Ctrl+S** saves configuration. Credentials remain environment variables;
+the interface does not store API keys. Discovery is not a connection test.
+
+Automatic update installation is unavailable until a supported release and
+installation mechanism exists. The update view reports the current build
+version; it does not claim to check for or install a newer release.
 
 ## Implement a model provider
 

@@ -12,7 +12,7 @@ use servoloop_robot::{
     CommandReceipt, JointLimit, JointLimitPolicy, RobotCommand, RobotDriver, RobotHarness,
     RobotState,
 };
-use servoloop_store::{new_id, JournalRecord, Store, SCHEMA_VERSION};
+use servoloop_store::{new_id, JournalRecord, SessionGuard, Store, SCHEMA_VERSION};
 use std::io::{self, IsTerminal, Read};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::{
@@ -23,8 +23,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+mod tui;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     version: Option<u32>,
@@ -46,6 +47,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Run(RunArgs),
+    Resume(ResumeArgs),
     Models(ModelsArgs),
     Providers,
     Config(ConfigArgs),
@@ -88,6 +90,24 @@ struct RunArgs {
     tool_timeout: Option<u64>,
 }
 #[derive(Debug, Args)]
+struct ResumeArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    session: String,
+    #[arg(long)]
+    demo: bool,
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+    #[arg(long)]
+    driver: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    max_turns: usize,
+    #[arg(long, value_name = "SECONDS")]
+    model_timeout: Option<u64>,
+    #[arg(long, value_name = "SECONDS")]
+    tool_timeout: Option<u64>,
+}
+#[derive(Debug, Args)]
 struct ModelsArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -109,6 +129,9 @@ struct SessionsArgs {
     store: Option<PathBuf>,
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Include the persisted terminal snapshot instead of only journal records.
+    #[arg(long)]
+    snapshot: bool,
 }
 
 #[derive(Serialize)]
@@ -121,9 +144,9 @@ struct Event<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
 }
-fn emit(seq: &mut u64, sid: &str, event: &str, data: Option<Value>) {
+fn emit(seq: &mut u64, sid: &str, event: &str, data: Option<Value>) -> Result<(), String> {
     *seq += 1;
-    let line = serde_json::to_string(&Event {
+    let value = serde_json::to_value(Event {
         version: 1,
         sequence: *seq,
         session_id: sid,
@@ -134,27 +157,83 @@ fn emit(seq: &mut u64, sid: &str, event: &str, data: Option<Value>) {
         event,
         data,
     })
-    .unwrap();
-    println!("{}", redact(&line));
+    .map_err(|e| format!("event serialization: {e}"))?;
+    let value = redact_value(value)?;
+    println!(
+        "{}",
+        serde_json::to_string(&value).map_err(|e| format!("event serialization: {e}"))?
+    );
+    Ok(())
 }
 fn redact(input: &str) -> String {
-    let mut out = input.to_string();
-    for name in [
+    let secrets = [
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
         "NVIDIA_API_KEY",
         "SERVOLOOP_API_KEY",
-    ] {
-        if let Ok(secret) = env::var(name) {
-            if !secret.is_empty() {
-                out = out.replace(&secret, "[REDACTED]");
-            }
-        }
-    }
-    out
+    ]
+    .into_iter()
+    .filter_map(|name| env::var(name).ok())
+    .collect::<Vec<_>>();
+    redact_text(input, &secrets)
 }
-fn redact_value(value: Value) -> Value {
-    serde_json::from_str(&redact(&value.to_string())).unwrap_or(value)
+fn redact_value(value: Value) -> Result<Value, String> {
+    let secrets = [
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "NVIDIA_API_KEY",
+        "SERVOLOOP_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|name| env::var(name).ok())
+    .collect::<Vec<_>>();
+    redact_value_with_secrets(value, &secrets)
+}
+fn redact_text(input: &str, secrets: &[String]) -> String {
+    let mut secrets = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    // Replacing longer values first prevents a short configured secret from
+    // leaving the suffix of a longer one visible.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.into_iter().fold(input.to_owned(), |text, secret| {
+        text.replace(secret, "[REDACTED]")
+    })
+}
+fn redact_value_with_secrets(value: Value, secrets: &[String]) -> Result<Value, String> {
+    match value {
+        Value::String(text) => Ok(Value::String(redact_text(&text, secrets))),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| redact_value_with_secrets(value, secrets))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(values) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in values {
+                let key = redact_text(&key, secrets);
+                if redacted.contains_key(&key) {
+                    return Err("redaction produced duplicate object keys".into());
+                }
+                redacted.insert(key, redact_value_with_secrets(value, secrets)?);
+            }
+            Ok(Value::Object(redacted))
+        }
+        value => Ok(value),
+    }
+}
+fn print_value(value: Value) -> Result<(), String> {
+    let value = redact_value(value)?;
+    println!(
+        "{}",
+        serde_json::to_string(&value).map_err(|e| format!("output serialization: {e}"))?
+    );
+    Ok(())
+}
+fn redacted_session(session: &servoloop_core::Session) -> Result<servoloop_core::Session, String> {
+    let value = serde_json::to_value(session).map_err(|e| format!("session serialization: {e}"))?;
+    serde_json::from_value(redact_value(value)?).map_err(|e| format!("redacted session: {e}"))
 }
 fn safe_config(cfg: &Config) -> Value {
     let mut value = serde_json::to_value(cfg).unwrap_or(Value::Null);
@@ -194,7 +273,7 @@ fn init_config(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 fn usage() {
-    eprintln!("usage: servoloop <run|providers|models|config|sessions> [options]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
+    eprintln!("usage: servoloop <run|resume|providers|models|config|sessions> [options]\n  run --demo [--store DIR] [--session ID]\n  run --prompt TEXT --provider ID --model ID [--store DIR] [--session ID]\n  resume SESSION --prompt TEXT --provider ID --model ID [--store DIR]\n  models --provider ID [--offline --model ID]\n  sessions list|show ID|delete ID");
 }
 fn value(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
@@ -228,6 +307,23 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             "--max-turns",
             "--model-timeout",
             "--tool-timeout",
+            "--json",
+            "--output",
+        ],
+        "resume" => &[
+            "--store",
+            "--provider",
+            "--model",
+            "--base-url",
+            "--config",
+            "--prompt",
+            "--driver",
+            "--max-turns",
+            "--model-timeout",
+            "--tool-timeout",
+            "--demo",
+            "--json",
+            "--output",
         ],
         "models" => &[
             "--provider",
@@ -235,9 +331,11 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             "--base-url",
             "--offline",
             "--config",
+            "--json",
+            "--output",
         ],
         "config" => &["--config"],
-        "sessions" => &["--store", "--config"],
+        "sessions" => &["--store", "--config", "--snapshot"],
         "providers" => &[],
         _ => return Err(format!("unknown command `{command}`")),
     };
@@ -253,6 +351,7 @@ fn validate_args(args: &[String]) -> Result<(), String> {
         "--max-turns",
         "--model-timeout",
         "--tool-timeout",
+        "--output",
     ];
     let mut i = 1;
     while i < args.len() {
@@ -408,16 +507,20 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
         let prompt = prompt_from_args(args)?;
         let model: Arc<dyn Model> =
             Arc::new(OpenAiCompatProvider::new(spec, model).map_err(|e| e.to_string())?);
-        return run_loop(args, cfg, model, prompt, false).await;
+        return run_loop(args, cfg, model, prompt, false, None).await;
     }
     let st = store(args, Some(cfg))?;
     let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
+    if st.sessions().map_err(|e| e.to_string())?.contains(&sid) {
+        return Err("session already exists; use `resume` to continue it".into());
+    }
     st.create_session(&sid).map_err(|e| e.to_string())?;
+    let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
     if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
         return Err("session has an unresolved intent; refusing to resume automatically".into());
     }
     let mut seq = 0;
-    emit(&mut seq, &sid, "session_started", None);
+    emit(&mut seq, &sid, "session_started", None)?;
     let intent = JournalRecord {
         version: SCHEMA_VERSION,
         sequence: 0,
@@ -457,7 +560,7 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
     wrapped
         .register_arc(Arc::new(JournalTool {
             inner: command_tool,
-            store: st.clone(),
+            guard: guard.clone(),
             intent: intent.clone(),
         }))
         .map_err(|e| e.to_string())?;
@@ -473,36 +576,113 @@ async fn run(args: &[String], cfg: &Config) -> Result<i32, String> {
     let stop = StopToken::new();
     let event_seq = Arc::new(StdMutex::new(seq));
     let event_seq_sink = event_seq.clone();
+    let event_error = Arc::new(StdMutex::new(None));
+    let event_error_sink = event_error.clone();
     let result = agent
         .run(
             &mut session,
             "Move the shoulder to 0.2 radians.",
             &|event: AgentEvent| {
-                emit(
+                if let Err(error) = emit(
                     &mut event_seq_sink.lock().expect("event sequence lock"),
                     &sid,
                     "agent_event",
                     serde_json::to_value(event).ok(),
-                );
+                ) {
+                    *event_error_sink.lock().expect("event error lock") = Some(error);
+                }
             },
             &stop,
         )
         .await;
     seq = *event_seq.lock().expect("event sequence lock");
+    if let Some(error) = event_error.lock().expect("event error lock").clone() {
+        return Err(format!("failed to redact agent event: {error}"));
+    }
     let output = result.map_err(|e| e.to_string())?;
+    if let Err(error) = redacted_session(&session)
+        .and_then(|session| guard.save_snapshot(&session).map_err(|e| e.to_string()))
+    {
+        emit(
+            &mut seq,
+            &sid,
+            "session_finished",
+            Some(json!({"outcome":"failed", "error":error})),
+        )?;
+        return Err(format!("failed to save session snapshot: {error}"));
+    }
     emit(
         &mut seq,
         &sid,
         "verified",
         Some(json!({"simulated":true,"output":output})),
-    );
+    )?;
     emit(
         &mut seq,
         &sid,
         "session_finished",
         Some(json!({"outcome":"success"})),
-    );
+    )?;
     Ok(0)
+}
+
+async fn resume(args: &[String], cfg: &Config) -> Result<i32, String> {
+    if value(args, "--driver")
+        .or_else(|| cfg.driver.clone())
+        .as_deref()
+        .unwrap_or("simulated")
+        != "simulated"
+    {
+        return Err("only the simulated driver is implemented; Isaac is not available".into());
+    }
+    let sid = args.get(1).ok_or("session ID is required")?.clone();
+    let st = store(args, Some(cfg))?;
+    if !st.sessions().map_err(|e| e.to_string())?.contains(&sid) {
+        return Err("session not found".into());
+    }
+    // Acquire before loading either the journal or snapshot. The guard remains
+    // alive through the complete run and terminal snapshot write.
+    let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
+    let session = st
+        .load_snapshot_guarded(&guard)
+        .map_err(|e| format!("cannot resume session: {e}"))?;
+    if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
+        return Err("session has unresolved tool outcomes; refusing to resume".into());
+    }
+    let prompt = prompt_from_args(args)?;
+    let model: Arc<dyn Model> = if has(args, "--demo") {
+        Arc::new(DemoModel(Mutex::new(0)))
+    } else {
+        let name = setting(
+            args,
+            "--provider",
+            "SERVOLOOP_PROVIDER",
+            cfg.provider.clone(),
+        )
+        .ok_or("--provider is required")?;
+        let model_name = setting(args, "--model", "SERVOLOOP_MODEL", cfg.model.clone())
+            .ok_or("--model is required")?;
+        let spec = provider(
+            &name,
+            setting(
+                args,
+                "--base-url",
+                "SERVOLOOP_BASE_URL",
+                cfg.base_url.clone(),
+            ),
+        )?;
+        spec.validate().map_err(|e| format!("provider: {e}"))?;
+        Arc::new(OpenAiCompatProvider::new(spec, model_name).map_err(|e| e.to_string())?)
+    };
+    run_loop(
+        args,
+        cfg,
+        model,
+        prompt,
+        has(args, "--demo"),
+        Some((sid, guard, session)),
+    )
+    .await
 }
 
 async fn run_loop(
@@ -511,6 +691,7 @@ async fn run_loop(
     model: Arc<dyn Model>,
     prompt: String,
     simulated: bool,
+    restored: Option<(String, Arc<SessionGuard>, servoloop_core::Session)>,
 ) -> Result<i32, String> {
     if !machine_output(args) {
         eprintln!(
@@ -519,20 +700,28 @@ async fn run_loop(
         );
     }
     let st = store(args, Some(cfg))?;
-    let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
-    st.create_session(&sid).map_err(|e| e.to_string())?;
-    if !st.unresolved(&sid).map_err(|e| e.to_string())?.is_empty() {
-        return Err("session has an unresolved intent; refusing to resume automatically".into());
-    }
+    let is_restored = restored.is_some();
+    let (sid, guard, mut session) = match restored {
+        Some((sid, guard, session)) => (sid, guard, session),
+        None => {
+            let sid = value(args, "--session").unwrap_or_else(|| new_id("session"));
+            if st.sessions().map_err(|e| e.to_string())?.contains(&sid) {
+                return Err("session already exists; use `resume` to continue it".into());
+            }
+            st.create_session(&sid).map_err(|e| e.to_string())?;
+            let guard = Arc::new(st.acquire_session(&sid).map_err(|e| e.to_string())?);
+            (sid.clone(), guard, servoloop_core::Session::new(&sid))
+        }
+    };
     let mut seq = 0;
-    emit(&mut seq, &sid, "session_started", None);
+    emit(&mut seq, &sid, "session_started", None)?;
     let intent = JournalRecord {
         version: SCHEMA_VERSION,
         sequence: 0,
         session_id: sid.clone(),
         intent_id: new_id("intent"),
         kind: "intent".into(),
-        arguments: redact_value(json!({"prompt": prompt})),
+        arguments: redact_value(json!({"prompt": prompt}))?,
         outcome: None,
     };
     let driver = Arc::new(SimulatedDriver(Mutex::new(RobotState {
@@ -565,7 +754,7 @@ async fn run_loop(
     wrapped
         .register_arc(Arc::new(JournalTool {
             inner: command_tool,
-            store: st.clone(),
+            guard: guard.clone(),
             intent,
         }))
         .map_err(|e| e.to_string())?;
@@ -601,7 +790,18 @@ async fn run_loop(
         "Operate the robot conservatively; verify every action.",
     )
     .with_config(loop_config);
-    let mut session = servoloop_core::Session::new(&sid);
+    if session
+        .messages
+        .iter()
+        .any(|m| matches!(m, servoloop_core::Message::ToolUnknown { .. }))
+    {
+        return Err("session has unresolved ToolUnknown results; refusing to resume".into());
+    }
+    if !session.messages.is_empty() && is_restored {
+        session.messages.push(servoloop_core::Message::System {
+            content: "Resume disclaimer: this is a fresh simulated environment. Prior robot observations are historical and are not current state; do not replay prior movement.".into(),
+        });
+    }
     let stop = StopToken::new();
     let signal_stop = stop.clone();
     let signal = tokio::spawn(async move {
@@ -614,20 +814,20 @@ async fn run_loop(
     });
     let event_seq = Arc::new(StdMutex::new(seq));
     let event_seq_sink = event_seq.clone();
+    let event_error = Arc::new(StdMutex::new(None));
+    let event_error_sink = event_error.clone();
+    let event_callback = |event: AgentEvent| {
+        if let Err(error) = emit(
+            &mut event_seq_sink.lock().expect("event sequence lock"),
+            &sid,
+            "agent_event",
+            serde_json::to_value(event).ok(),
+        ) {
+            *event_error_sink.lock().expect("event error lock") = Some(error);
+        }
+    };
     let run_result = agent
-        .run(
-            &mut session,
-            prompt,
-            &|event: AgentEvent| {
-                emit(
-                    &mut event_seq_sink.lock().expect("event sequence lock"),
-                    &sid,
-                    "agent_event",
-                    serde_json::to_value(event).ok(),
-                );
-            },
-            &stop,
-        )
+        .run(&mut session, prompt, &event_callback, &stop)
         .await;
     let interrupted = stop.is_stopped();
     signal.abort();
@@ -644,6 +844,9 @@ async fn run_loop(
         None
     };
     seq = *event_seq.lock().expect("event sequence lock");
+    if let Some(error) = event_error.lock().expect("event error lock").clone() {
+        return Err(format!("failed to redact agent event: {error}"));
+    }
     if interrupted {
         // A stop racing the final model response is still an interrupted run:
         // never turn an action with uncertain timing into a success.
@@ -654,23 +857,34 @@ async fn run_loop(
             Some(
                 json!({"outcome": "interrupted", "error": stop_error.unwrap_or_else(|| "run stopped; action outcome requires reconciliation".into())}),
             ),
-        );
+        )?;
         return Err("run stopped; action outcome requires reconciliation".into());
     }
     match run_result {
         Ok(output) => {
+            if let Err(error) = redacted_session(&session)
+                .and_then(|session| guard.save_snapshot(&session).map_err(|e| e.to_string()))
+            {
+                emit(
+                    &mut seq,
+                    &sid,
+                    "session_finished",
+                    Some(json!({"outcome":"failed", "error":error})),
+                )?;
+                return Err(format!("failed to save session snapshot: {error}"));
+            }
             emit(
                 &mut seq,
                 &sid,
                 "verified",
                 Some(json!({"simulated": simulated, "output": output})),
-            );
+            )?;
             emit(
                 &mut seq,
                 &sid,
                 "session_finished",
                 Some(json!({"outcome":"success"})),
-            );
+            )?;
             Ok(0)
         }
         Err(error) => {
@@ -681,7 +895,7 @@ async fn run_loop(
                 Some(
                     json!({"outcome": if interrupted { "interrupted" } else { "failed" }, "error": error.to_string()}),
                 ),
-            );
+            )?;
             Err(error.to_string())
         }
     }
@@ -711,13 +925,14 @@ impl RobotDriver for SimulatedDriver {
 struct DemoModel(Mutex<u8>);
 #[async_trait]
 impl Model for DemoModel {
-    async fn complete(&self, _request: ModelRequest) -> CoreResult<ModelResponse> {
+    async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
         let mut n = self.0.lock().await;
+        let suffix = request.messages.len();
         let response = match *n {
             0 => ModelResponse {
                 content: "Inspecting first.".into(),
                 tool_calls: vec![ToolCall {
-                    id: "observe-1".into(),
+                    id: format!("observe-{suffix}"),
                     name: "robot_observe".into(),
                     arguments: json!({}),
                 }],
@@ -726,7 +941,7 @@ impl Model for DemoModel {
             1 => ModelResponse {
                 content: "Making the requested small move.".into(),
                 tool_calls: vec![ToolCall {
-                    id: "move-1".into(),
+                    id: format!("move-{suffix}"),
                     name: "robot_command".into(),
                     arguments: json!({"command":"move_joint","joint":"shoulder","position":0.2}),
                 }],
@@ -741,7 +956,7 @@ impl Model for DemoModel {
 
 struct JournalTool {
     inner: Arc<dyn Tool>,
-    store: Store,
+    guard: Arc<SessionGuard>,
     intent: JournalRecord,
 }
 #[async_trait]
@@ -753,8 +968,9 @@ impl Tool for JournalTool {
     }
     async fn execute(&self, args: Value) -> CoreResult<ToolOutput> {
         let mut intent = self.intent.clone();
-        intent.arguments = redact_value(args.clone());
-        self.store.append(intent.clone()).map_err(|e| {
+        intent.intent_id = new_id("intent");
+        intent.arguments = redact_value(args.clone()).map_err(servoloop_core::Error::Tool)?;
+        self.guard.append(intent.clone()).map_err(|e| {
             servoloop_core::Error::Tool(format!("journal failed; motion not dispatched: {e}"))
         })?;
         match self.inner.execute(args).await {
@@ -762,7 +978,7 @@ impl Tool for JournalTool {
                 let mut done = intent;
                 done.kind = "result".into();
                 done.outcome = Some("verified".into());
-                self.store
+                self.guard
                     .append(done)
                     .map_err(|e| servoloop_core::Error::Tool(e.to_string()))?;
                 Ok(out)
@@ -774,7 +990,7 @@ impl Tool for JournalTool {
                 // operator reconciles the robot state.
                 failed.kind = "result".into();
                 failed.outcome = None;
-                let _ = self.store.append(failed);
+                let _ = self.guard.append(failed);
                 Err(e)
             }
         }
@@ -806,6 +1022,21 @@ async fn main() -> ExitCode {
         return ExitCode::from(code);
     }
     if args.is_empty() {
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            let (cfg, startup_error) = match load_config(&args) {
+                Ok(cfg) => (cfg, None),
+                Err(_) => (Config::default(), Some(
+                    "Configuration could not be loaded and was left unchanged. The offline demo is available. Run `servoloop config validate` to diagnose the file before saving settings.".to_string()
+                )),
+            };
+            return match tui::run(cfg, startup_error).await {
+                Ok(code) => ExitCode::from(code as u8),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         usage();
         return ExitCode::from(2);
     }
@@ -839,6 +1070,7 @@ async fn main() -> ExitCode {
     };
     let result: Result<i32, String> = match command.as_str() {
         "run" => run(&args, &cfg).await,
+        "resume" => resume(&args, &cfg).await,
         "models" => models(&args, &cfg).await,
         "config" => match config_action(&args) {
             "init" => init_config(&args).map(|_| 0),
@@ -846,10 +1078,7 @@ async fn main() -> ExitCode {
                 println!("valid");
                 Ok(0)
             }
-            "show" => {
-                println!("{}", redact(&safe_config(&cfg).to_string()));
-                Ok(0)
-            }
+            "show" => print_value(safe_config(&cfg)).map(|_| 0),
             action => Err(format!("unknown config action `{action}`")),
         },
         "sessions" => sessions(&args, &cfg).map(|_| 0),
@@ -892,33 +1121,35 @@ async fn models(args: &[String], cfg: &Config) -> Result<i32, String> {
         if opts.explicit_model_ids.is_empty() {
             return Err("--offline requires --model".into());
         }
-        println!(
-            "{}",
-            serde_json::to_string(&opts.explicit_model_ids).unwrap()
-        );
+        print_value(serde_json::to_value(&opts.explicit_model_ids).map_err(|e| e.to_string())?)?;
         return Ok(0);
     };
     let found = Discovery::new()
         .discover(&spec, &opts)
         .await
         .map_err(|e| e.to_string())?;
-    println!("{}", serde_json::to_string(&found).unwrap());
+    print_value(serde_json::to_value(&found).map_err(|e| e.to_string())?)?;
     Ok(0)
 }
 fn sessions(args: &[String], cfg: &Config) -> Result<(), String> {
     let st = store(args, Some(cfg))?;
     match args.get(1).map(String::as_str) {
-        Some("list") | None => println!("{}", json!(st.sessions().map_err(|e| e.to_string())?)),
-        Some("show") => println!(
-            "{}",
-            redact(
-                &serde_json::to_string(
-                    &st.records(args.get(2).ok_or("session ID required")?)
-                        .map_err(|e| e.to_string())?
+        Some("list") | None => print_value(json!(st.sessions().map_err(|e| e.to_string())?))?,
+        Some("show") => {
+            let value = if has(args, "--snapshot") {
+                serde_json::to_value(
+                    st.load_snapshot(args.get(2).ok_or("session ID required")?)
+                        .map_err(|e| e.to_string())?,
                 )
-                .unwrap()
-            )
-        ),
+            } else {
+                serde_json::to_value(
+                    st.records(args.get(2).ok_or("session ID required")?)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            print_value(value)?;
+        }
         Some("delete") => {
             st.delete(args.get(2).ok_or("session ID required")?)
                 .map_err(|e| e.to_string())?;
@@ -927,6 +1158,50 @@ fn sessions(args: &[String], cfg: &Config) -> Result<(), String> {
         _ => return Err("sessions requires list, show, or delete".into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redacts_nested_values_and_object_keys_without_json_round_trip_leaks() {
+        let secrets = vec![
+            "quote\"secret".into(),
+            "slash\\secret".into(),
+            "line\nsecret".into(),
+            "秘密".into(),
+        ];
+        let value = json!({
+            "quote\"secret": ["quote\"secret", {"nested": "slash\\secret"}],
+            "line": "秘密 and line\nsecret",
+        });
+        let redacted = redact_value_with_secrets(value, &secrets).unwrap();
+        let text = redacted.to_string();
+        assert_eq!(
+            redacted,
+            json!({
+                "[REDACTED]": ["[REDACTED]", {"nested": "[REDACTED]"}],
+                "line": "[REDACTED] and [REDACTED]",
+            })
+        );
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("秘密"));
+    }
+
+    #[test]
+    fn plain_text_redaction_handles_escaped_secret_characters() {
+        let secrets = vec!["quote\"secret".into(), "line\nsecret".into()];
+        let output = redact_text("error: quote\"secret / line\nsecret", &secrets);
+        assert_eq!(output, "error: [REDACTED] / [REDACTED]");
+    }
+
+    #[test]
+    fn redaction_fails_closed_on_object_key_collisions() {
+        let secrets = vec!["secret".into()];
+        let value = json!({"secret": 1, "[REDACTED]": 2});
+        assert!(redact_value_with_secrets(value, &secrets).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -986,6 +1261,7 @@ mod cancellation_tests {
         let store = Store::open(&root).unwrap();
         let sid = "cancel-session";
         store.create_session(sid).unwrap();
+        let guard = Arc::new(store.acquire_session(sid).unwrap());
         let ready = Arc::new(Notify::new());
         let tool = Arc::new(ReadyThenHang {
             ready: ready.clone(),
@@ -1005,7 +1281,7 @@ mod cancellation_tests {
         tools
             .register_arc(Arc::new(JournalTool {
                 inner: tool.clone(),
-                store: store.clone(),
+                guard,
                 intent,
             }))
             .unwrap();

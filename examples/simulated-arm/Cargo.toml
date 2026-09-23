@@ -8,6 +8,6 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 serde_json.workspace = true
-servoloop-core = { path = "../../crates/servoloop-core" }
+servoloop-core = { package = "unravel-agent-runtime", version = "=0.1.1" }
 servoloop-robot = { path = "../../crates/servoloop-robot" }
 tokio.workspace = true
