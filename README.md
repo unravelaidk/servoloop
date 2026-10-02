@@ -61,6 +61,16 @@ static libjpeg-turbo; NASM and system libjpeg are not required. Git dependency
 consumption does not publish a registry release. Application robot authorization
 and physical-safety gates remain in ServoLoop.
 
+Runtime **0.2.0** is published separately as
+[`unravel-agent-runtime`](https://crates.io/crates/unravel-agent-runtime/0.2.0),
+[`unravel-agent-providers`](https://crates.io/crates/unravel-agent-providers/0.2.0),
+and the [Node package](https://www.npmjs.com/package/@unravelai/unravel-agent-runtime).
+ServoLoop retains its immutable reviewed Rust Git pin. For Node consumers,
+`npm install @unravelai/unravel-agent-runtime` installs the current `latest`
+release without a version suffix. See the
+[0.2.0 release and Rust migration notes](https://github.com/unravelaidk/unravel-agent-runtime/releases/tag/v0.2.0)
+and the [shared runtime README](https://github.com/unravelaidk/unravel-agent-runtime#020).
+
 ## Run the example
 
 Run the deterministic simulator from the repository root:
