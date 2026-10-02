@@ -5,11 +5,11 @@ use std::{env, time::Duration};
 /// Observe–act–verify against either the CPU mock or an operator-configured
 /// Isaac bridge. This example never retries an ambiguous command.
 #[tokio::main]
-async fn main() -> servoloop_core::Result<()> {
+async fn main() -> unravel_agent_runtime::Result<()> {
     let endpoint =
         env::var("SERVOLOOP_BRIDGE_URL").unwrap_or_else(|_| "http://127.0.0.1:8765".into());
     let token = env::var("SERVOLOOP_BRIDGE_TOKEN").map_err(|_| {
-        servoloop_core::Error::InvalidInput("SERVOLOOP_BRIDGE_TOKEN is required".into())
+        unravel_agent_runtime::Error::InvalidInput("SERVOLOOP_BRIDGE_TOKEN is required".into())
     })?;
     let driver = IsaacDriver::with_timeout(endpoint, token, Duration::from_secs(5))?;
     driver.handshake("operator-configured").await?;

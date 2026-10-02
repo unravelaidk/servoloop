@@ -11,7 +11,7 @@ futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-servoloop-core = { path = "../servoloop-core" }
+unravel-agent-runtime.workspace = true
 servoloop-robot = { path = "../servoloop-robot" }
 thiserror.workspace = true
 tokio.workspace = true

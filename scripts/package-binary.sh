@@ -24,7 +24,7 @@ else
   mkdir -p "$stage/bin"
   install -m 0755 "$binary" "$stage/bin/servoloop"
 fi
-cp "$root/LICENSE" "$root/crates/servoloop-providers/NOTICE" "$stage/"
+cp "$root/LICENSE" "$root/NOTICE" "$stage/"
 cat >"$stage/README" <<EOF
 ServoLoop $version ($target)
 

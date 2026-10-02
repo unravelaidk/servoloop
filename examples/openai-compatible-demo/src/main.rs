@@ -1,4 +1,4 @@
-//! Live model demo for the servoloop-providers OpenAI-compatible adapter.
+//! Live model demo for the shared Unravel OpenAI-compatible adapter.
 //!
 //! This example demonstrates discovery and invocation of an
 //! OpenAI-compatible provider. It requires a live API key and makes
@@ -38,11 +38,12 @@
 //! still fail at runtime due to rate limits, model unavailability, or
 //! provider-side changes. Always handle typed errors from invocation.
 
-use servoloop_core::{Message, Model, ModelRequest, Session};
-use servoloop_providers::{
-    Discovery, DiscoveryOptions, OpenAiCompatProvider, ProviderError, ProviderSpec, Secret,
-};
 use std::env;
+use unravel_agent_providers::{
+    ChatOptions, Discovery, DiscoveryOptions, OpenAiCompatProvider, ProviderError, ProviderSpec,
+    Secret,
+};
+use unravel_agent_runtime::{Message, Model, ModelRequest, Session};
 
 fn parse_args() -> Args {
     let mut provider = "openai".to_string();
@@ -203,6 +204,19 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let mut options = ChatOptions::default();
+    if spec.id == "openrouter" {
+        options.headers.insert(
+            "http-referer",
+            "https://github.com/unravelaidk/servoloop"
+                .parse()
+                .expect("static header"),
+        );
+        options
+            .headers
+            .insert("x-title", "ServoLoop".parse().expect("static header"));
+    }
+    let provider = provider.with_chat_options(options);
 
     println!("Provider: {} ({})", spec.display_name, spec.id);
     println!("Model: {}", args.model);

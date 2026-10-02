@@ -37,14 +37,29 @@ adapts them for embodied systems:
 
 ## Repository layout
 
-The workspace separates the generic agent runtime from robot-specific code:
+The workspace keeps robot-specific code local and pins the shared Rust packages
+from [Unravel Agent Runtime](https://github.com/unravelaidk/unravel-agent-runtime)
+to an exact Git revision in `Cargo.toml` and `Cargo.lock`:
 
-- `crates/servoloop-core` contains the agent loop, model trait, tools, sessions,
+- `unravel-agent-runtime` owns the agent loop, model/tool contracts, sessions,
   events, retries, and stop token.
+- `unravel-agent-providers` owns Chat Completions transport and model discovery.
 - `crates/servoloop-robot` contains robot drivers, commands, state, safety
   policies, and agent-facing robot tools.
+- `crates/servoloop-store` owns durable sessions, intent/result journals, and leases.
+- `crates/servoloop-isaac` owns the simulator bridge.
+- `apps/servoloop-cli` owns CLI/TUI presentation and execution policy, including
+  journal-before-side-effect ordering and application-specific provider headers.
 - `examples/simulated-arm` demonstrates an observe-act-observe loop without
   physical hardware.
+
+The pinned shared 0.2.0 revision also provides next-turn-only Rust tool
+observations, strict bounded PNG/JPEG validation, and tri-state image capability
+metadata. Images are not inferred from model names or attachment flags.
+Building the shared providers requires **CMake and a C compiler** for bundled
+static libjpeg-turbo; NASM and system libjpeg are not required. Git dependency
+consumption does not publish a registry release. Application robot authorization
+and physical-safety gates remain in ServoLoop.
 
 ## Run the example
 
@@ -57,29 +72,24 @@ cargo run -p servoloop-simulated-arm
 The example emits newline-delimited JSON events, executes a safety-checked
 joint command, and prints the final model response.
 
-## Implement a model provider
+## Use a model provider
 
-The `Model` trait is the only contract a provider implements. Implement
-`complete` to return a fully assembled response; override `stream` and set
-`can_stream` to `true` when the provider supports streaming deltas. The loop
-assembles all streamed deltas into a single `ModelResponse` before any tool
-executes, so streaming and non-streaming providers are interchangeable.
+The shared provider crate implements OpenAI-compatible Chat Completions. For a
+different protocol, implement the shared `Model` trait. Providers return a fully
+assembled response; streaming events do not dispatch partial tool calls.
 
-```rust
-use servoloop_core::{Error, Model, ModelError, ModelRequest, ModelResponse, Result};
-use async_trait::async_trait;
+```rust,no_run
+use unravel_agent_runtime::{Message, Model, ModelRequest};
+use unravel_agent_providers::{OpenAiCompatProvider, ProviderSpec};
 
-struct MyModel;
-
-#[async_trait]
-impl Model for MyModel {
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
-        // Forward to your provider, classify errors, and return a complete
-        // response. Use ModelError::auth / invalid for permanent errors and
-        // ModelError::transient / rate_limit for retryable ones.
-        Err(Error::ModelTyped(ModelError::auth("not implemented")))
-    }
-}
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let spec = ProviderSpec::openai(std::env::var("OPENAI_API_KEY")?);
+let provider = OpenAiCompatProvider::new(spec, "gpt-4o-mini")?;
+let request = ModelRequest::new("demo", vec![Message::user_text("Hello")]);
+let response = provider.complete(request).await?;
+println!("{}", response.content);
+# Ok(())
+# }
 ```
 
 The loop carries `session_id` and `max_output` through requests and typed

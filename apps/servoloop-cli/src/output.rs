@@ -159,8 +159,8 @@ pub(crate) fn print_value(value: Value) -> Result<(), String> {
     Ok(())
 }
 pub(crate) fn redacted_session(
-    session: &servoloop_core::Session,
-) -> Result<servoloop_core::Session, String> {
+    session: &unravel_agent_runtime::Session,
+) -> Result<unravel_agent_runtime::Session, String> {
     let value = serde_json::to_value(session).map_err(|e| format!("session serialization: {e}"))?;
     serde_json::from_value(redact_value(value)?).map_err(|e| format!("redacted session: {e}"))
 }

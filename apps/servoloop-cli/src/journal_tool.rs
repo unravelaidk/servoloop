@@ -5,7 +5,7 @@ pub(crate) struct JournalTool {
 }
 #[async_trait]
 impl Tool for JournalTool {
-    fn definition(&self) -> servoloop_core::ToolDefinition {
+    fn definition(&self) -> unravel_agent_runtime::ToolDefinition {
         let mut d = self.inner.definition();
         d.name = "robot_command".into();
         d
@@ -13,9 +13,12 @@ impl Tool for JournalTool {
     async fn execute(&self, args: Value) -> CoreResult<ToolOutput> {
         let mut intent = self.intent.clone();
         intent.intent_id = new_id("intent");
-        intent.arguments = redact_value(args.clone()).map_err(servoloop_core::Error::Tool)?;
+        intent.arguments =
+            redact_value(args.clone()).map_err(unravel_agent_runtime::Error::Tool)?;
         self.guard.append(intent.clone()).map_err(|e| {
-            servoloop_core::Error::Tool(format!("journal failed; motion not dispatched: {e}"))
+            unravel_agent_runtime::Error::Tool(format!(
+                "journal failed; motion not dispatched: {e}"
+            ))
         })?;
         match self.inner.execute(args).await {
             Ok(out) => {
@@ -24,7 +27,7 @@ impl Tool for JournalTool {
                 done.outcome = Some("verified".into());
                 self.guard
                     .append(done)
-                    .map_err(|e| servoloop_core::Error::Tool(e.to_string()))?;
+                    .map_err(|e| unravel_agent_runtime::Error::Tool(e.to_string()))?;
                 Ok(out)
             }
             Err(e) => {
@@ -44,6 +47,6 @@ impl Tool for JournalTool {
 use crate::output::redact_value;
 use async_trait::async_trait;
 use serde_json::Value;
-use servoloop_core::{Result as CoreResult, Tool, ToolOutput};
 use servoloop_store::{new_id, JournalRecord, SessionGuard};
 use std::sync::Arc;
+use unravel_agent_runtime::{Result as CoreResult, Tool, ToolOutput};

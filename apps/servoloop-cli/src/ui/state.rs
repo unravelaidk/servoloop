@@ -1,10 +1,10 @@
 use crate::output::{redact, redact_value, RunOutput};
 use serde_json::Value;
-use servoloop_core::Event;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
 };
+use unravel_agent_runtime::Event;
 
 const MAX_ACTIVITY: usize = 64;
 

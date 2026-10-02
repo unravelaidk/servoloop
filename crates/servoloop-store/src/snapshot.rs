@@ -18,12 +18,12 @@ use std::{
 pub(crate) struct Envelope {
     pub(crate) version: u32,
     pub(crate) journal_sequence: u64,
-    pub(crate) session: servoloop_core::Session,
+    pub(crate) session: unravel_agent_runtime::Session,
 }
 
 pub(crate) fn write(
     dir: &Path,
-    session: &servoloop_core::Session,
+    session: &unravel_agent_runtime::Session,
     journal_sequence: u64,
     unresolved: bool,
 ) -> Result<()> {
@@ -31,7 +31,7 @@ pub(crate) fn write(
         || session
             .messages
             .iter()
-            .any(|message| matches!(message, servoloop_core::Message::ToolUnknown { .. }))
+            .any(|message| matches!(message, unravel_agent_runtime::Message::ToolUnknown { .. }))
     {
         return Err(StoreError::Unresolved);
     }
@@ -78,13 +78,13 @@ pub(crate) fn validate(
     snapshot: Envelope,
     journal_sequence: u64,
     unresolved: bool,
-) -> Result<servoloop_core::Session> {
+) -> Result<unravel_agent_runtime::Session> {
     if unresolved
         || snapshot
             .session
             .messages
             .iter()
-            .any(|message| matches!(message, servoloop_core::Message::ToolUnknown { .. }))
+            .any(|message| matches!(message, unravel_agent_runtime::Message::ToolUnknown { .. }))
     {
         return Err(StoreError::Unresolved);
     }

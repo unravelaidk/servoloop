@@ -99,7 +99,7 @@ try {
   const template = JSON.parse(await readFile(join(root, 'packages', name, 'package.json'), 'utf8'));
   template.version = version; await writeFile(join(dir, 'package.json'), JSON.stringify(template, null, 2) + '\n');
   await cp(source, join(dir, 'bin', executable));
-  await cp(join(root, 'LICENSE'), join(dir, 'LICENSE')); await cp(join(root, 'crates/servoloop-providers/NOTICE'), join(dir, 'NOTICE'));
+  await cp(join(root, 'LICENSE'), join(dir, 'LICENSE')); await cp(join(root, 'NOTICE'), join(dir, 'NOTICE'));
   await pack(dir);
   const launcher = join(stage, 'servoloop'); await mkdir(join(launcher, 'bin'), { recursive: true });
   const launcherPackage = JSON.parse(await readFile(join(root, 'packages/servoloop/package.json'), 'utf8'));
@@ -107,7 +107,7 @@ try {
   for (const dependency of Object.keys(launcherPackage.optionalDependencies)) launcherPackage.optionalDependencies[dependency] = version;
   await writeFile(join(launcher, 'package.json'), JSON.stringify(launcherPackage, null, 2) + '\n');
   await cp(join(root, 'packages/servoloop/bin/servoloop.mjs'), join(launcher, 'bin/servoloop.mjs'));
-  await cp(join(root, 'LICENSE'), join(launcher, 'LICENSE')); await cp(join(root, 'crates/servoloop-providers/NOTICE'), join(launcher, 'NOTICE'));
+  await cp(join(root, 'LICENSE'), join(launcher, 'LICENSE')); await cp(join(root, 'NOTICE'), join(launcher, 'NOTICE'));
   await pack(launcher);
   const output = join(root, 'dist/npm'); await mkdir(output, { recursive: true });
   await cp(join(dir, `${name}-${version}.tgz`), join(output, `${name}-${version}.tgz`));
