@@ -53,6 +53,14 @@ to an exact Git revision in `Cargo.toml` and `Cargo.lock`:
 - `examples/simulated-arm` demonstrates an observe-act-observe loop without
   physical hardware.
 
+The pinned shared 0.2.0 revision also provides next-turn-only Rust tool
+observations, strict bounded PNG/JPEG validation, and tri-state image capability
+metadata. Images are not inferred from model names or attachment flags.
+Building the shared providers requires **CMake and a C compiler** for bundled
+static libjpeg-turbo; NASM and system libjpeg are not required. Git dependency
+consumption does not publish a registry release. Application robot authorization
+and physical-safety gates remain in ServoLoop.
+
 ## Run the example
 
 Run the deterministic simulator from the repository root:

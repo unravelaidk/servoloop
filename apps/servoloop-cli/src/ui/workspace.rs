@@ -562,10 +562,10 @@ impl Workspace {
                             ToolSupport::No => "not supported",
                             ToolSupport::Unknown => "unknown",
                         },
-                        if m.modalities.image_input {
-                            "supported"
-                        } else {
-                            "unknown"
+                        match m.modalities.image_input {
+                            Some(true) => "supported",
+                            Some(false) => "not supported",
+                            None => "unknown",
                         },
                         if m.context_window == 0 {
                             "unknown".into()
